@@ -182,12 +182,21 @@ export class BrowserPool extends EventEmitter {
         headless: this.opts.headless ?? true,
         args: [
           '--no-sandbox',
-          '--disable-dev-shm-usage',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage', // /dev/shm is tiny in containers
           '--disable-gpu',
           '--autoplay-policy=no-user-gesture-required',
           '--js-flags=--max-old-space-size=128',
           '--disable-background-networking',
           '--disable-extensions',
+          '--disable-background-timer-throttling',
+          '--disable-renderer-backgrounding',
+          '--disable-features=Translate,BackForwardCache,AcceptCHFrame,MediaRouter',
+          // Keep the media pipeline alive in a headless container; without these
+          // the player often never requests audio at all.
+          '--autoplay-policy=no-user-gesture-required',
+          '--mute-audio',
+          '--window-size=1280,800',
         ],
       });
       this.browser = browser;

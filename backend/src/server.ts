@@ -133,6 +133,33 @@ export async function buildServer(): Promise<FastifyInstance> {
 
   app.get('/api/health', async () => ({ ok: true }));
 
+  /** Deployment diagnostics: confirms the browser actually launched. */
+  app.get('/api/diagnostics', async () => {
+    const base = {
+      chromiumPath: config.chromiumPath || '(auto-detect found nothing)',
+      headless: config.headless,
+      cacheDir: config.cacheDir || '(disabled)',
+      staticDir: config.staticDir || '(none)',
+      node: process.version,
+      platform: `${process.platform}/${process.arch}`,
+      memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      ...pool.stats(),
+    };
+    try {
+      const { chromium } = await import('playwright-core');
+      const browser = await chromium.launch({
+        executablePath: config.chromiumPath || undefined,
+        headless: config.headless,
+        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
+      });
+      const version = browser.version();
+      await browser.close();
+      return { ...base, browserLaunch: 'ok', browserVersion: version };
+    } catch (err) {
+      return { ...base, browserLaunch: 'failed', browserError: (err as Error).message.slice(0, 400) };
+    }
+  });
+
   app.get('/api/stats', async () => ({
     bytesOut,
     bytesOutHuman: `${(bytesOut / 1024 ** 2).toFixed(1)} MB`,
