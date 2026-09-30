@@ -197,6 +197,8 @@ export class BrowserPool extends EventEmitter {
           '--autoplay-policy=no-user-gesture-required',
           '--mute-audio',
           '--window-size=1280,800',
+          // Optional extra memory saving for very small containers.
+          ...(process.env.CHROMIUM_SINGLE_PROCESS === 'true' ? ['--single-process', '--no-zygote'] : []),
         ],
       });
       this.browser = browser;
@@ -216,6 +218,27 @@ export class BrowserPool extends EventEmitter {
     } finally {
       this.launching = null;
     }
+  }
+
+  /**
+   * Resource diet.
+   *
+   * A free instance has 512 MB total. YouTube Music's page is heavy: images,
+   * stylesheets, fonts and video frames can easily push the renderer past the
+   * container limit, which gets the whole service OOM-killed. None of that is
+   * needed to negotiate an audio stream, so we refuse it and keep only the
+   * scripts and API calls that actually matter.
+   */
+  private async installResourceDiet(page: Page): Promise<void> {
+    await page.route('**/*', async (route: Route) => {
+      const type = route.request().resourceType();
+      // NOTE: never block 'media' or 'xhr' — that is how the player fetches audio.
+      if (type === 'image' || type === 'font' || type === 'stylesheet') {
+        await route.abort().catch(() => {});
+        return;
+      }
+      await route.continue().catch(() => {});
+    });
   }
 
   private async ensureContext(): Promise<BrowserContext> {
@@ -301,6 +324,7 @@ export class BrowserPool extends EventEmitter {
   private async negotiate(session: PlaybackSession): Promise<void> {
     const context = await this.ensureContext();
     const page = await context.newPage();
+    await this.installResourceDiet(page);
     session.phase = 'negotiating';
     const started = Date.now();
 
@@ -445,6 +469,7 @@ export class BrowserPool extends EventEmitter {
    * than driving the page's own player.
    */
   private async runCapture(session: PlaybackSession): Promise<Buffer> {
+    // Capture is a pure HTTP loop; it never opens a page.
     const audio = session.audio;
     if (!audio) throw new Error('session has no negotiated audio url');
 
