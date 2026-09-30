@@ -1,4 +1,35 @@
 /** Runtime configuration, all overridable by environment variable. */
+import { existsSync } from 'node:fs';
+
+/**
+ * Find a usable Chromium binary.
+ *
+ * `playwright-core` ships no browser, and the path differs between distros
+ * (`chromium` on Debian/Ubuntu 24.04+, `chromium-browser` on Ubuntu 22.04 and
+ * older). Checking well-known locations keeps deployment working without having
+ * to pin CHROMIUM_PATH per platform.
+ */
+function detectChromium(): string {
+  const candidates = [
+    process.env.CHROME_PATH ?? '',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/snap/bin/chromium',
+    '/usr/lib/chromium/chromium',
+    '/opt/google/chrome/chrome',
+  ].filter(Boolean);
+  for (const p of candidates) {
+    try {
+      if (existsSync(p)) return p;
+    } catch {
+      /* ignore */
+    }
+  }
+  return '';
+}
+
 
 function num(name: string, fallback: number): number {
   const v = process.env[name];
@@ -17,8 +48,8 @@ export const config = {
   port: num('PORT', 10000),
   host: process.env.HOST ?? '0.0.0.0',
 
-  /** Path to a Chromium/Chrome binary. Blank lets playwright-core search. */
-  chromiumPath: process.env.CHROMIUM_PATH ?? '',
+  /** Path to a Chromium/Chrome binary. Blank triggers auto-detection. */
+  chromiumPath: process.env.CHROMIUM_PATH || detectChromium(),
   headless: bool('HEADLESS', true),
 
   /** Concurrency + lifetimes, tuned for a 512 MB / 0.1 CPU free instance. */
