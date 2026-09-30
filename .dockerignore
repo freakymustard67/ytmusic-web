@@ -1,0 +1,12 @@
+**/node_modules
+**/dist
+.git
+.gitignore
+*.log
+.env
+.env.*
+research/
+docs/
+README.md
+render.yaml
+frontend/

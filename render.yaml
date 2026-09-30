@@ -1,0 +1,40 @@
+# Render blueprint — free tier.
+#
+# IMPORTANT: the free instance gives the *whole workspace* 5 GB of egress per
+# month and suspends every free service when it is exhausted. One listener can
+# therefore take down your other free services. Set BANDWIDTH_CAP_GB to keep a
+# safety margin (0 = unlimited, the current default).
+
+services:
+  - type: web
+    name: ytmusic-web
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    plan: free
+    region: singapore
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: HEADLESS
+        value: "true"
+      # Sessions are expensive on 0.1 CPU / 512 MB; keep concurrency low.
+      - key: MAX_SESSIONS
+        value: "2"
+      - key: SESSION_TTL_MS
+        value: "600000"
+      - key: BROWSER_IDLE_MS
+        value: "180000"
+      - key: CACHE_MAX_MB
+        value: "384"
+      # Safety valve: stop streaming after this much egress in one process life.
+      # 0 disables the guard. Raise/lower to taste.
+      - key: BANDWIDTH_CAP_GB
+        value: "0"
+      # Optional shared password. Leave unset for a fully public deployment.
+      # - key: ACCESS_PASSWORD
+      #   sync: false
+      - key: RATE_LIMIT_PER_MIN
+        value: "90"

@@ -1,0 +1,154 @@
+# Findings: how YouTube Music playback actually works server-side
+
+All results below were reproduced on this machine (Debian, Node 22, Chromium via
+`playwright-core`) against real YouTube Music. Nothing here is speculative — each
+claim has a command behind it in `research/poc/`.
+
+## 1. Metrolist cannot run on a server
+
+`MetrolistGroup/Metrolist` is an Android application:
+
+| Evidence | Value |
+| --- | --- |
+| `compileSdk` | 37, `minSdk` 26 |
+| Core deps | AndroidX Compose, Media3/ExoPlayer, Room, Hilt, DataStore |
+| InnerTube layer | `MetrolistGroup/innertubex` — "eXtended InnerTube API library for Kotlin" |
+| Cipher/PoTokens | `ZemerTeam/zemer-cipher` — "standalone **Android** library … PoToken (BotGuard) generation" |
+
+PoToken generation in Metrolist happens **inside an Android `WebView`**
+(`zemer-cipher` is tagged `android`, `webview`, `botguard`). There is no JVM/server
+build target, so "run Metrolist on Render" is not a porting exercise — it is a rewrite.
+
+## 2. Search / metadata is easy
+
+`youtubei.js` performs InnerTube search for songs, videos, albums, artists and
+playlists from plain Node with no browser and no PoToken:
+
+```
+music.search('kesariya', { type: 'song' })  -> "Kesariya (From \"Brahmastra\")" | Arijit Singh
+music.search('lofi hip hop', { type: 'video' }) -> videos-as-songs work identically
+```
+
+One gotcha: `Innertube.create({ retrieve_player: false })` breaks streaming data
+parsing later. Keep `retrieve_player: true`.
+
+## 3. Stream URLs always come back signature-ciphered
+
+`chooseFormat()` returns `url: undefined` and populates `signature_cipher`. Deciphering
+requires the `n`/`sig` transform from the player script:
+
+```
+Error: To decipher URLs, you must provide your own JavaScript evaluator.
+```
+
+`youtubei.js` v18 has no evaluator on Node — it is a deliberate hole. It is fillable in
+~15 lines with `node:vm` (see `research/poc/bench-range.mjs`). With that in place you get
+a real `rr*.googlevideo.com` URL.
+
+## 4. The 403 wall — and exactly what clears it
+
+| Attempt | Result |
+| --- | --- |
+| Deciphered URL, fetch from Node, no token | **403** |
+| Deciphered URL, fetch from Node, valid PoToken minted out-of-band | **403** (`pot=true`) |
+| Deciphered URL, fetch **from inside the browser page** | **403** |
+| The browser's **own player** playing the same track | **200 ×16, zero 403** |
+
+Conclusion: a URL that `youtubei.js` resolves is **not** interchangeable with the URL
+Chromium's player uses, even from the same IP with a valid PoToken and correct `Origin`.
+YouTube binds playback to the player session/context, not just to the token.
+
+**Therefore the browser must be the thing that negotiates playback.**
+
+## 5. PoToken minting does work headlessly from a datacenter IP
+
+`bgutils-js` (BotGuard) inside an injected bundle, running in a real page context:
+
+```
+BotGuard VM loaded: object (globalName=trayride)
+botguardResponse: 2017 bytes
+GenerateIT: HTTP 200  -> ["MkGIR9j/…", 43200]   (12h TTL)
+PO TOKEN minted: 804 chars
+```
+
+Two non-obvious requirements:
+- The BotGuard interpreter must be fetched **from Node** and injected
+  (`page.addScriptTag({ content })`) — YouTube's CSP demands `TrustedScriptURL` /
+  `TrustedScript`, and `connect-src` blocks an in-page fetch.
+- CSP headers must be stripped on the way through (`page.route` + strip
+  `content-security-policy*`), otherwise Trusted Types rejects the injection.
+
+Note: minting a PoToken is **not sufficient** on its own (see §4).
+
+## 6. Delivering bytes: the winning mechanism
+
+Intercept the browser's own audio requests with Playwright's `page.route`, then replay
+them from Node using **the request's own headers**:
+
+```js
+await page.route(/googlevideo\.com\/videoplayback.*mime=audio/, async (route) => {
+  const req = route.request();
+  const resp = await route.fetch();          // exact URL + headers replayed
+  const body = await resp.body();
+  await route.fulfill({ response: resp, body });
+});
+```
+
+Result: `status 200`, ~66 KB audio segments, `itag 251`, player advancing
+(`t=19.5s`, `duration=114.7s`, `error=null`).
+
+Headers the request carries and that matter:
+`accept, origin, referer, user-agent, sec-ch-ua*`.
+
+## 7. UMP demuxing (the last blocker, solved)
+
+Audio responses are **not** plain WebM. `Content-Type` is
+`application/vnd.yt-ump`, YouTube's Unified Media Protocol. Raw concatenation does not
+parse, and neither `ffmpeg` nor a client `MediaSource` can decode it:
+
+```
+ffprobe /tmp/seg-concat.bin  -> Invalid data found when processing input
+sb.appendBuffer(umpBytes)    -> "appended OK, buffered=0s"   (silently useless)
+```
+
+Frame layout, derived empirically:
+
+```
+[ small protobuf header ][ raw container bytes … ]
+   ^ carries videoId + itag (itag 251 appears in the header)
+                          ^ starts with 1a 45 df a3  (EBML magic -> WebM)
+```
+
+There is **no length prefix before the header** — the first byte is a protobuf field tag.
+Locating the container magic is therefore the robust strategy (works for both WebM/EBML
+and ISO-BMFF `ftyp`):
+
+```
+container: webm
+header:    {bytes: 58, videoId: "NJAv_7lHUIU"}
+media:     758069 bytes, magic 1a45dfa39f428681
+
+ffprobe -> codec_name=opus  sample_rate=48000  channels=2
+           format_name=matroska,webm  duration=268.181000
+```
+
+That is a valid, complete-length Opus stream. See `backend/ump.mjs`.
+
+## 8. Cost / platform reality (Render free tier)
+
+| Constraint | Value |
+| --- | --- |
+| Spin-down | after 15 min with no inbound traffic (idle WebSockets do **not** count) |
+| Cold start | ~1 minute |
+| Egress | **5 GB/month for the whole workspace**, then *all* free services are suspended |
+| Overage | $0.15/GB (Hobby), not a hard cap if a card is attached |
+| RAM / CPU | 0.1 CPU, 512 MB |
+| Disks | **not available on free** — filesystem is ephemeral |
+| AUP | no explicit anti-media-proxy clause; enforcement via generic clauses + DMCA |
+
+At ~128 kbps, 5 GB ≈ **87 hours** of audio across all users. A single popular link
+exhausts it and takes `carmel-portal`, your scrapers and the other free services down
+with it until the month rolls over.
+
+**Mitigations implemented:** `BANDWIDTH_CAP_GB` guard (stops streaming at a threshold),
+`MAX_SESSIONS` concurrency limit, and per-IP rate limiting.
