@@ -152,3 +152,28 @@ with it until the month rolls over.
 
 **Mitigations implemented:** `BANDWIDTH_CAP_GB` guard (stops streaming at a threshold),
 `MAX_SESSIONS` concurrency limit, and per-IP rate limiting.
+
+## 9. Render free tier cannot host this (measured)
+
+Deployed to Render free (`0.1 CPU / 512 MB`) with Chromium installed via the build
+command. Results:
+
+| Check | Result |
+| --- | --- |
+| Chromium launches | ✅ `/usr/bin/chromium`, version `154.0.8037.57` |
+| Codecs (opus/AAC/VP9/H.264) | ✅ all `probably` / `MediaSource.isSupported` true |
+| Search + lyrics API | ✅ works (metadata needs no browser) |
+| Node idle RSS | **~300 MB of the 512 MB budget, before Chromium starts** |
+| Load `music.youtube.com` and play | ❌ container OOM-killed; Render returns 502, service restarts ~30 s later |
+| After the resource diet (block image/font/stylesheet) | negotiation no longer crashes, but still never receives audio |
+
+The OOM is reproducible: any endpoint that actually loads the YouTube Music page
+kills the container, while lightweight endpoints keep working. Chromium plus that
+page needs roughly 300–500 MB on its own, which does not fit beside Node in 512 MB.
+
+`CHROMIUM_SINGLE_PROCESS=true` and `MAX_SESSIONS=1` reduce pressure and stop the
+crash, but not enough to reach playback.
+
+**Conclusion:** the architecture is sound (it runs perfectly on a normal machine),
+but a 512 MB free instance is below the floor for browser-based negotiation. The
+same image works on any host with ~1 GB+ of RAM.

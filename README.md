@@ -87,6 +87,19 @@ Any Chromium/Chrome binary works; `playwright-core` does not download one.
 `render.yaml` is a ready blueprint (Docker runtime, free plan, health check at
 `/health`). Push the repo, then in Render: **New → Blueprint**, pick the repo.
 
+### Free-tier limitation (measured, not theoretical)
+
+Render's free instance is **512 MB**, and Node idles at ~300 MB of it. Loading
+YouTube Music in Chromium needs a few hundred MB more, so the container gets
+**OOM-killed** and Render serves a 502 while it restarts. Search and lyrics work;
+playback does not. This is documented with measurements in
+[docs/FINDINGS.md §9](docs/FINDINGS.md).
+
+To run this in practice you need a host with roughly **1 GB+ RAM**. Anything with
+real egress is also a far better fit than the free tier's 5 GB/month — for example
+Oracle Cloud Always Free (10 TB/month egress, 12 GB RAM) costs nothing and removes
+both limits at once.
+
 ### Read this before making it public
 
 Render's free instance gives your **entire workspace 5 GB of egress per month**,
