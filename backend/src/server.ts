@@ -170,9 +170,11 @@ export async function buildServer(): Promise<FastifyInstance> {
   }));
 
   /**
-   * Probe what a real page load looks like from this host. Diagnostic only:
-   * tells us whether YouTube is challenging the IP, showing consent, or simply
-   * not negotiating audio.
+   * Lightweight deployment probe.
+   *
+   * Deliberately minimal: Render's free instance has 512 MB, and a heavy probe
+   * that opens several renderers can OOM the container. This one opens a single
+   * page, blocks images/fonts, and reports how far the player gets.
    */
   app.get('/api/probe/:videoId', async (req) => {
     const { videoId } = req.params as { videoId: string };
@@ -185,54 +187,59 @@ export async function buildServer(): Promise<FastifyInstance> {
         headless: config.headless,
         args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
       });
-      const ctx = await browser.newContext({
-        userAgent: config.userAgent,
-        viewport: { width: 1280, height: 800 },
-      });
+      const ctx = await browser.newContext({ userAgent: config.userAgent, viewport: { width: 1280, height: 800 } });
       const page = await ctx.newPage();
-      const audio: string[] = [];
+      // Block heavy resources: music playback needs none of them.
+      await page.route('**/*', async (route) => {
+        const type = route.request().resourceType();
+        if (type === 'image' || type === 'font' || type === 'stylesheet' || type === 'media') {
+          await route.abort();
+          return;
+        }
+        await route.continue();
+      });
+      let audioCount = 0;
       page.on('request', (r) => {
         const u = r.url();
-        if (/googlevideo\.com\/videoplayback/.test(u) && /mime=audio/.test(u)) audio.push(u.slice(0, 90));
+        if (/googlevideo\.com\/videoplayback/.test(u) && /mime=audio/.test(u)) audioCount++;
       });
-      const first = await page.goto('https://music.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      out.homeStatus = first?.status();
-      await page.waitForTimeout(5000);
+
+      const home = await page.goto('https://music.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 40_000 });
+      out.homeStatus = home?.status();
+      await page.waitForTimeout(3500);
       out.home = await page.evaluate(() => ({
         title: document.title,
         hasYtcfg: typeof (window as any).ytcfg !== 'undefined',
-        visitor: !!(window as any).ytcfg?.get?.('INNERTUBE_CONTEXT')?.client?.visitorData,
-        botWall: /confirm you.?re not a bot|unusual traffic|sign in to continue/i.test(document.body?.innerText || ''),
-        consent: /before you continue|accept all|reject all/i.test(document.body?.innerText || ''),
-        bodyStart: (document.body?.innerText || '').slice(0, 120).replace(/\s+/g, ' '),
+        hasVisitor: !!(window as any).ytcfg?.get?.('INNERTUBE_CONTEXT')?.client?.visitorData,
+        botWall: /confirm you.?re not a bot|unusual traffic/i.test(document.body?.innerText || ''),
+        bytes: document.body?.innerText?.length ?? 0,
       }));
 
-      const watch = await page.goto(`https://music.youtube.com/watch?v=${videoId}`, { waitUntil: 'domcontentloaded', timeout: 45_000 });
-      out.watchStatus = watch?.status();
-      out.sawAudioRequestEarly = audio.length;
-      for (let i = 0; i < 8; i++) {
-        await page.evaluate(() => {
-          const v = document.querySelector('video') as HTMLVideoElement | null;
-          if (v) { v.muted = true; v.play?.().catch(() => {}); }
-          document.querySelector<HTMLElement>('.ytp-skip-ad-button, .ytp-ad-skip-button')?.click?.();
-        }).catch(() => {});
-        await page.waitForTimeout(1500);
+      await page.goto(`https://music.youtube.com/watch?v=${videoId}`, { waitUntil: 'domcontentloaded', timeout: 40_000 });
+      const deadline = Date.now() + 60_000;
+      let state: any = null;
+      while (Date.now() < deadline && audioCount === 0) {
+        state = await page
+          .evaluate(() => {
+            const v = document.querySelector('video') as HTMLVideoElement | null;
+            if (v) { v.muted = true; v.play?.().catch(() => {}); }
+            document.querySelector<HTMLElement>('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern')?.click?.();
+            return {
+              hasVideoEl: !!v,
+              readyState: v?.readyState ?? null,
+              currentTime: v ? +v.currentTime.toFixed(2) : null,
+              duration: v ? +(v.duration || 0).toFixed(1) : null,
+              error: v?.error?.code ?? null,
+              hasPlayerApi: typeof (window as any).ytmusic !== 'undefined',
+            };
+          })
+          .catch(() => null);
+        if (audioCount > 0) break;
+        await page.waitForTimeout(1200);
       }
-      out.audioRequests = audio.length;
-      out.audioSample = audio.slice(0, 2);
-      out.player = await page.evaluate(() => {
-        const v = document.querySelector('video') as HTMLVideoElement | null;
-        return {
-          hasVideoEl: !!v,
-          currentTime: v ? +v.currentTime.toFixed(2) : null,
-          duration: v ? +(v.duration || 0).toFixed(1) : null,
-          readyState: v?.readyState ?? null,
-          error: v?.error?.code ?? null,
-          botWall: /confirm you.?re not a bot|unusual traffic/i.test(document.body?.innerText || ''),
-          playability: (document.querySelector('.ytmusic-player-bar')?.textContent || '').slice(0, 80),
-        };
-      });
-      out.ok = audio.length > 0;
+      out.player = state;
+      out.audioRequests = audioCount;
+      out.ok = audioCount > 0;
       return out;
     } catch (err) {
       out.error = (err as Error).message.slice(0, 300);
