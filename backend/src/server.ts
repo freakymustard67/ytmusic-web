@@ -28,6 +28,7 @@ import { getLyrics } from './lyrics.js';
 import { TrackService } from './tracks.js';
 import { openAudioStream, toNodeReadable } from './sabr.js';
 import { proxyStatus } from './proxy.js';
+import { egressInfo, probeYouTubeEndpoints } from './egress.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
 
 const tracks = new TrackService({
@@ -152,6 +153,28 @@ export async function buildServer(): Promise<FastifyInstance> {
     } catch (err) {
       return { ...base, sabr: 'failed', videoId: probeId, error: (err as Error).message.slice(0, 300) };
     }
+  });
+
+  /**
+   * What address does this process egress from, and does YouTube accept it?
+   * The fastest way to tell an IP problem apart from an application bug.
+   */
+  app.get('/api/egress', async (req) => {
+    const videoId = String((req.query as any)?.videoId ?? 'ZczAI-GNFbk');
+    const [info, endpoints] = await Promise.all([
+      egressInfo(),
+      probeYouTubeEndpoints(videoId).catch(() => null),
+    ]);
+    const verdict = !endpoints
+      ? 'could not reach YouTube at all'
+      : endpoints.player.ok
+        ? 'playback should work: /player is accepted from this IP'
+        : endpoints.browse.ok
+          ? 'this IP is distrusted for playback: /browse works but /player is refused (HTTP ' +
+            endpoints.player.status +
+            '). Use a residential/ISP egress (HTTPS_PROXY) or pin EGRESS_FAMILY=ipv4/ipv6.'
+          : 'no YouTube endpoint is reachable from this IP';
+    return { videoId, proxy: proxyStatus(), egress: info, endpoints, verdict };
   });
 
   /** Temporary: which clients work from this host's IP. */

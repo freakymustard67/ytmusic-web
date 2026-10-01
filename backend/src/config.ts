@@ -52,6 +52,13 @@ export const config = {
 
   /** Trust X-Forwarded-For for rate limiting (true behind a reverse proxy). */
   trustProxy: bool('TRUST_PROXY', true),
+
+  /**
+   * Which address family to prefer for outbound connections.
+   * YouTube's DNS answers AAAA first, so on a dual-stack host traffic may leave
+   * over IPv6; pin `ipv4` if the v6 route is the one being refused.
+   */
+  egressFamily: (process.env.EGRESS_FAMILY ?? 'auto') as 'auto' | 'ipv4' | 'ipv6',
 };
 
 export type Config = typeof config;
