@@ -26,42 +26,56 @@ server — see [docs/FINDINGS.md](docs/FINDINGS.md).
                                           rr*.googlevideo.com
 ```
 
-## Why the architecture is shaped this way
+## How it works
 
-Four findings drove the design (all reproduced, with commands, in
-[docs/FINDINGS.md](docs/FINDINGS.md)):
+YouTube's web clients no longer hand out direct media URLs — they are **SABR-only**
+("server-side adaptive bitrate"). A URL resolved programmatically is either ciphered
+or rejected with HTTP 403, and a PoToken does not fix it, because the two transports
+bind the token differently:
 
-1. **A stream URL resolved programmatically is useless.** `youtubei.js` can
-   decipher a real `googlevideo.com` URL, but fetching it returns **HTTP 403** —
-   even from the same IP, even with a valid PoToken, even from inside the browser.
-   The URL that Chromium's own player uses is *not* interchangeable with the one
-   the API resolves. So a real browser must negotiate playback.
-2. **The browser cannot fetch the audio itself.** Google's CDN returns no
-   `access-control-allow-origin` header at all (`vary: Origin`, 403 on preflight),
-   so a cross-origin `fetch`/`<audio src>` from your page is impossible. The server
-   must relay the bytes.
-3. **Responses are UMP-framed, not plain WebM.** `Content-Type` is
-   `application/vnd.yt-ump`. Concatenating it raw yields silence and neither
-   `ffmpeg` nor a client `MediaSource` can decode it. The frame header must be
-   stripped (`backend/src/ump.ts`).
-4. **YouTube interleaves ads.** A session happily negotiates *ad* audio against the
-   requested video, which is why early captures stopped after ~20 s. Ad frames
-   carry the ad's own videoId in their UMP header, so the code filters on it.
+| | SABR (what the page player uses) | direct `adaptiveFormats[].url` |
+| --- | --- | --- |
+| Request | `POST streamingData.serverAbrStreamingUrl` | `GET` a media URL |
+| Token binding | **video id**, in the protobuf body | `visitorData`, as `?pot=` |
+| Status | current | removed from WEB clients |
 
-The resulting pipeline: Chromium negotiates → we hold the signed URL plus the
-browser's headers → we re-fetch that URL repeatedly (each request returns the *next*
-UMP chunk; `range` is ignored) → demux each frame → concatenate. A 4-minute track
-arrives as **~4.5 MB in ~1.5–3 s**.
+So this server speaks SABR directly:
 
-## Screenshots
+```
+browser ──► Fastify API ──► youtubei.js (search / metadata)
+                 │          lrclib + YouTube Music (lyrics)
+                 │
+                 └──► SABR client (googlevideo)  ──►  rr*.googlevideo.com
+                          • PoToken minted with bgutils-js (no browser)
+                          • stream arrives already demuxed
+                          • cached to disk → byte-range seeking
+```
 
-Search and playback (queue, shuffle/repeat, seek, download):
+**No headless browser is involved.** That is the important part: an earlier version
+drove a real Chromium page, which peaked near 800 MB and was OOM-killed on a 512 MB
+free instance. Speaking SABR directly brings resident memory to **~150–300 MB**.
+Details, including the two bugs that cost the most time, are in
+[docs/FINDINGS.md](docs/FINDINGS.md).
 
-![Player](docs/screenshot-player.png)
+## Deployment status (read this)
 
-Time-synced lyrics, with the active line highlighted and click-to-seek:
+The app is complete and verified **locally**: search, playback, seeking, downloads
+and synced lyrics all work, with no console errors. Two independent limits bite when
+deploying to a free tier:
 
-![Lyrics](docs/screenshot-lyrics.png)
+1. **Memory — solved.** SABR needs no browser, so a 512 MB instance now fits
+   (measured 149 MB on Render).
+2. **IP reputation — not solvable from a free tier.** Managed hosts hand out
+   datacenter IPs, and YouTube refuses `/youtubei/v1/player` from them with **403**
+   for *every* client (WEB, visionos, android_vr, …), even though PoToken minting
+   works. `/youtubei/v1/browse` is not blocked, so **search works while playback
+   does not** — exactly what the live Render deployment shows.
+
+To get playback you need one of:
+
+- a host whose egress IP is not flagged (a home connection works out of the box);
+- a residential/ISP proxy in front of a datacenter host (`HTTPS_PROXY`);
+- authenticated cookies — effective, but it puts a real Google account at risk.
 
 ## Endpoints
 
@@ -137,12 +151,8 @@ For a genuinely public deployment, a host with real egress is a much better fit
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `PORT` | `10000` | listen port |
-| `CHROMIUM_PATH` | auto | Chromium/Chrome binary |
-| `HEADLESS` | `true` | run Chromium headless |
-| `MAX_SESSIONS` | `2` | concurrent playback sessions |
-| `SESSION_TTL_MS` | `600000` | idle session lifetime |
-| `BROWSER_IDLE_MS` | `180000` | close Chromium after this idle time |
-| `NEGOTIATE_TIMEOUT_MS` | `30000` | playback negotiation budget |
+| `MAX_CONCURRENT_FETCHES` | `2` | simultaneous SABR track downloads |
+| `FETCH_MAX_MS` | `150000` | abort a track download after this long |
 | `CACHE_DIR` | `/tmp/ytmusic-cache` | captured audio cache (empty disables) |
 | `CACHE_MAX_MB` | `512` | cache ceiling before LRU eviction |
 | `CAPTURE_MAX_MS` | `150000` | per-track capture budget |

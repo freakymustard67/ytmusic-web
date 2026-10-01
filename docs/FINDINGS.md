@@ -100,7 +100,15 @@ Result: `status 200`, ~66 KB audio segments, `itag 251`, player advancing
 Headers the request carries and that matter:
 `accept, origin, referer, user-agent, sec-ch-ua*`.
 
-## 7. UMP demuxing (the last blocker, solved)
+## 7. UMP demuxing
+
+> **Correction (see §10).** UMP is not merely "a small protobuf header to strip".
+> It is a varint-framed part stream — `varint(partType)`, `varint(partSize)`,
+> payload — where `MEDIA` payloads begin with a 1-byte `headerId` selecting which
+> `MEDIA_HEADER` the bytes belong to. The magic-offset trick below happened to work
+> for the browser's concatenated output, but `UmpReader` from `googlevideo/ump`
+> is the correct way to parse it. The original notes are kept because they
+> document how the framing was first identified.
 
 Audio responses are **not** plain WebM. `Content-Type` is
 `application/vnd.yt-ump`, YouTube's Unified Media Protocol. Raw concatenation does not
@@ -177,3 +185,88 @@ crash, but not enough to reach playback.
 **Conclusion:** the architecture is sound (it runs perfectly on a normal machine),
 but a 512 MB free instance is below the floor for browser-based negotiation. The
 same image works on any host with ~1 GB+ of RAM.
+
+
+## 10. The real fix: speak SABR directly (no browser)
+
+Everything in §3–§9 was chasing the wrong transport. The browser's 200s and the
+API's 403s were never the same request:
+
+| | Browser playback | `adaptiveFormats[].url` |
+| --- | --- | --- |
+| Endpoint | `POST streamingData.serverAbrStreamingUrl` | `GET` a direct media URL |
+| Framing | UMP parts over SABR | plain HTTP range |
+| PoToken binding | **video id**, inside the protobuf body | `visitorData`, as a `?pot=` query param |
+| Status in 2026 | works | **removed from WEB clients** |
+
+"pot=true but 403" is the signature of a *binding* mismatch, not an invalid token.
+Two further traps:
+
+- **`web_music` BotGuard challenges cannot come from InnerTube `/att/get`** — they
+  must be scraped from page HTML (`window.ytAtN`). A token minted from an
+  InnerTube challenge for WEB_REMIX is rejected.
+- The BotGuard request key is **`O43z0dpjhgX20SCx4KAo`** (capital O).
+
+### Working implementation
+
+`LuanRT/googlevideo`'s `SabrStream` drives the SABR protocol and hands back an
+already-demuxed audio `ReadableStream`. Combined with `bgutils-js` for the token
+and `youtubei.js` for the player response, playback needs **no browser at all**
+(`backend/src/sabr.ts`).
+
+Measured locally: a 3.14 MB track fetched in **~8 s**, byte-identical length to the
+`contentLength` the player advertised, valid WebM/Opus (48 kHz stereo), and
+byte-range seeking served from disk.
+
+Two implementation details that cost real debugging time:
+
+1. **`selectFormats()` requires both a video and an audio format.** With
+   `enabledTrackTypes: AUDIO_ONLY` alone it throws `No suitable formats found for
+   download`; audio-only needs explicit `audioFormat`/`videoFormat` selectors.
+2. **The ABR URL must come from the same player response as the formats and
+   ustreamer config.** Reusing a cached session made the URL carry a stale
+   `cver` (`2.20260623.01.00` instead of the session's `2.20260930.00.00`) and the
+   stream never terminated — it ran to 782 MB with `Stream stalled 5 times`.
+
+### Memory consequence
+
+| | Headless Chromium | SABR (no browser) |
+| --- | --- | --- |
+| Resident RSS | ~800 MB peak; OOM on a 512 MB instance | **~150–300 MB** |
+| Free-tier viability | impossible | fits |
+
+## 11. Render free tier, second blocker: the IP is blocked
+
+With Chromium gone, the OOM is solved (Render reports `rssMb: 149`). Playback
+still fails, for an unrelated and more fundamental reason:
+
+```
+GET /api/ipdiag   →  every client, HTTP 403
+WEB 403 · MWEB 403 · TV 403 · VISIONOS 403 · ANDROID_VR 403 · WEB_EMBEDDED_PLAYER 403 · IOS 403
+```
+
+- PoToken minting from Render **works** (`length: 124`), so the block is not
+  token-related.
+- It is not client-related either — `visionos`, which yt-dlp's client policy table
+  lists as requiring no PoToken, is refused just the same.
+- The block is **endpoint-specific**: `/youtubei/v1/browse` (search) still answers,
+  so search works on Render while `/youtubei/v1/player` (playback) and the lyrics
+  call (which needs `getInfo`) return 403.
+
+yt-dlp's pinned issue #10128 describes exactly this: an IP blocked while logged out,
+where a PO token provider "will not help if your IP is already blocked". The
+documented remedies are a different egress IP, or authenticated cookies — the latter
+risking the account.
+
+### Net result on Render free
+
+| Feature | Status |
+| --- | --- |
+| Search (songs, videos, albums, artists, playlists) | ✅ works |
+| Playback | ❌ 403 from Google; needs a non-datacenter egress IP |
+| Lyrics | ❌ needs `getInfo`, which is blocked |
+| Resources | ✅ 149 MB resident — no longer the constraint |
+
+Any host whose egress IP is not flagged, or a residential/ISP proxy in front of a
+datacenter host, removes this. The application itself is complete: it runs
+end-to-end locally with zero console errors.
