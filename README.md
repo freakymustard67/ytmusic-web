@@ -73,9 +73,16 @@ deploying to a free tier:
 
 To get playback you need one of:
 
-- a host whose egress IP is not flagged (a home connection works out of the box);
-- a residential/ISP proxy in front of a datacenter host (`HTTPS_PROXY`);
-- authenticated cookies — effective, but it puts a real Google account at risk.
+- a host whose egress address class is consumer-grade (a home connection works out
+  of the box);
+- **a routed IPv6 `/64` you can rotate within** — free, no home connection needed;
+  set `EGRESS_IPV6_PREFIX=2001:db8:1234:5678::/64`. Check whether a host supports
+  it with `./scripts/check-ipv6.sh`;
+- a sticky residential/ISP proxy in front of a datacenter host (`HTTPS_PROXY`).
+
+Measured: Render refuses playback in **both** tested regions (Oregon and
+Singapore, both AS16509), so region choice does not help. See
+[docs/EGRESS.md](docs/EGRESS.md) for costs, configuration and what does *not* work.
 
 ## Endpoints
 
