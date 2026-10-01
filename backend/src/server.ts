@@ -26,7 +26,7 @@ import { Readable } from 'node:stream';
 import { config } from './config.js';
 import { getLyrics } from './lyrics.js';
 import { TrackService } from './tracks.js';
-import { openAudioStream, toNodeReadable } from './sabr.js';
+import { hasSessionPoToken, openAudioStream, toNodeReadable } from './sabr.js';
 import { proxyStatus } from './proxy.js';
 import { egressInfo, probeYouTubeEndpoints } from './egress.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
@@ -139,6 +139,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       platform: `${process.platform}/${process.arch}`,
       rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
       engine: 'sabr (no browser)',
+      sessionPoToken: hasSessionPoToken(),
       cacheDir: config.cacheDir || '(disabled)',
       staticDir: config.staticDir || '(none)',
       bandwidthCapBytes: config.bandwidthCapBytes,

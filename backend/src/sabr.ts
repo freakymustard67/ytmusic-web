@@ -53,7 +53,10 @@ export interface SabrFormatLite {
 /* ------------------------------------------------------------------ */
 
 interface Minter {
+  /** Content token (video-id bound) — used for the SABR streaming request body. */
   mint: (contentBinding: string) => Promise<string>;
+  /** Session token (visitorData bound) — used on the player request itself. */
+  mintAsWebsafeString: (contentBinding: string) => Promise<string>;
   createdAt: number;
 }
 
@@ -157,7 +160,11 @@ async function createMinter(): Promise<Minter> {
     webPoSignalOutput,
   );
 
-  return { mint: (binding: string) => webPoMinter.mintAsWebsafeString(binding), createdAt: Date.now() };
+  return {
+    mint: (binding: string) => webPoMinter.mintAsWebsafeString(binding),
+    mintAsWebsafeString: (binding: string) => webPoMinter.mintAsWebsafeString(binding),
+    createdAt: Date.now(),
+  };
 }
 
 /** Reuse a minter for a while; minting is expensive and tokens last ~12h. */
@@ -174,15 +181,59 @@ export async function getMinter(): Promise<Minter> {
 
 let innertube: Innertube | null = null;
 
+/**
+ * An InnerTube session carrying a **session-level PoToken**.
+ *
+ * Two token bindings are involved and they are not interchangeable:
+ *   - the session token is bound to the session's own `visitorData` and goes on
+ *     the player request itself. Without it, `/youtubei/v1/player` answers
+ *     LOGIN_REQUIRED from any IP YouTube distrusts — which is exactly why
+ *     playback failed on a datacenter host while the same call succeeded from a
+ *     home connection.
+ *   - the SABR token is bound to the *video id* and travels inside the streaming
+ *     request body (see openAudioStream).
+ *
+ * The token must be minted against the same visitorData the session sends, so the
+ * session is created first, the token minted for its visitorData, then the session
+ * rebuilt with both.
+ */
 async function getInnertube(): Promise<Innertube> {
   installProxy();
   if (innertube) return innertube;
+
   // n-sig deciphering needs a JS evaluator; youtubei.js ships none for Node.
   Platform.shim.eval = (async (data: { output: string }) => new Function(data.output)()) as never;
-  // Match the reference implementation exactly: no client_type/lang/location
-  // overrides. Changing them alters the SABR session and the stream never ends.
-  innertube = await Innertube.create({ retrieve_player: true });
+
+  // Match the reference implementation's session shape: no client_type/lang
+  // overrides, which alter the SABR session and stop it terminating.
+  let session = await Innertube.create({ retrieve_player: true });
+
+  if (!process.env.DISABLE_SESSION_POTOKEN) {
+    try {
+      const visitorData = session.session.context.client.visitorData;
+      if (visitorData) {
+        const minter = await getMinter();
+        const poToken = await minter.mintAsWebsafeString(visitorData);
+        session = await Innertube.create({
+          retrieve_player: true,
+          po_token: poToken,
+          visitor_data: visitorData,
+        });
+        sessionPoToken = true;
+      }
+    } catch (err) {
+      console.warn('[sabr] session PoToken unavailable:', String(err).slice(0, 140));
+    }
+  }
+
+  innertube = session;
   return innertube;
+}
+
+/** Whether the active session carries a session-level PoToken. */
+let sessionPoToken = false;
+export function hasSessionPoToken(): boolean {
+  return sessionPoToken;
 }
 
 export interface PlayerInfo {
