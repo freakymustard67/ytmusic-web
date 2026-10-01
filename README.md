@@ -53,6 +53,16 @@ browser's headers → we re-fetch that URL repeatedly (each request returns the 
 UMP chunk; `range` is ignored) → demux each frame → concatenate. A 4-minute track
 arrives as **~4.5 MB in ~1.5–3 s**.
 
+## Screenshots
+
+Search and playback (queue, shuffle/repeat, seek, download):
+
+![Player](docs/screenshot-player.png)
+
+Time-synced lyrics, with the active line highlighted and click-to-seek:
+
+![Lyrics](docs/screenshot-lyrics.png)
+
 ## Endpoints
 
 | Method | Path | Purpose |
