@@ -97,13 +97,18 @@ export async function egressInfo(): Promise<EgressInfo> {
  * unambiguous rather than looking like an application bug.
  */
 export async function probeYouTubeEndpoints(videoId: string): Promise<{
+  identity: { clientName: string; clientVersion: string; hasVisitor: boolean };
   browse: { ok: boolean; status: number };
   player: { ok: boolean; status: number };
+  /** The same player call the SABR path makes, for a like-for-like comparison. */
+  playerViaSabrPath: { ok: boolean; status: number; note: string };
 }> {
   const { Innertube } = await import('youtubei.js');
   const yt = await Innertube.create({ retrieve_player: false });
   const key = yt.session.api_key;
   const client = yt.session.context.client;
+  // Which client identity is being used matters: per-client policies differ.
+  const identity = { clientName: client.clientName, clientVersion: client.clientVersion, hasVisitor: !!client.visitorData };
 
   const post = async (path: string, body: unknown) => {
     const res = await fetch(`https://www.youtube.com/youtubei/v1/${path}?key=${key}&prettyPrint=false`, {
@@ -130,8 +135,23 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
     }).catch(() => 0),
   ]);
 
+  // Reproduce the SABR path exactly: retrieve_player:true session + parsed call
+  // through the NavigationEndpoint, which is what 403'd in production.
+  let sabrStatus = 0;
+  let note = '';
+  try {
+    const { getPlayerInfo } = await import('./sabr.js');
+    const info = await getPlayerInfo(videoId);
+    sabrStatus = info.status === 'OK' ? 200 : 0;
+    note = `status=${info.status} formats=${info.formats.length}`;
+  } catch (err) {
+    note = String((err as Error).message).slice(0, 160);
+  }
+
   return {
+    identity,
     browse: { ok: browseStatus === 200, status: browseStatus },
     player: { ok: playerStatus === 200, status: playerStatus },
+    playerViaSabrPath: { ok: sabrStatus === 200, status: sabrStatus, note },
   };
 }
