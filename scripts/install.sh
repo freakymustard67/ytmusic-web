@@ -98,6 +98,11 @@ ENV_FILE="$APP_DIR/backend/.env"
   echo "RATE_LIMIT_PER_MIN=${RATE_LIMIT_PER_MIN:-90}"
   [ -n "${ACCESS_PASSWORD:-}" ] && echo "ACCESS_PASSWORD=$ACCESS_PASSWORD"
   [ -n "${HTTPS_PROXY:-}" ] && echo "HTTPS_PROXY=$HTTPS_PROXY"
+  # Rotate egress within a routed IPv6 prefix (the free way past YouTube's
+  # address-class block). Run scripts/check-ipv6.sh to see if this host can.
+  [ -n "${EGRESS_IPV6_PREFIX:-}" ] && echo "EGRESS_IPV6_PREFIX=$EGRESS_IPV6_PREFIX"
+  [ -n "${EGRESS_IPV6_POOL:-}" ] && echo "EGRESS_IPV6_POOL=$EGRESS_IPV6_POOL"
+  [ -n "${EGRESS_IPV6_IFACE:-}" ] && echo "EGRESS_IPV6_IFACE=$EGRESS_IPV6_IFACE"
 } > "$ENV_FILE"
 chown "$APP_USER:$APP_USER" "$ENV_FILE"
 chmod 600 "$ENV_FILE"
@@ -119,6 +124,11 @@ Restart=on-failure
 RestartSec=5
 # A track download is a few MB; keep the service inside a sane envelope.
 MemoryMax=1200M
+# IPv6 rotation must add source addresses to the interface. Without this the
+# kernel silently falls back to the primary address, so rotation appears to work
+# but never changes anything.
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
 
 [Install]
 WantedBy=multi-user.target
@@ -181,7 +191,17 @@ cat <<SUMMARY
     curl -s "localhost:$PORT/api/diagnostics?videoId=ZczAI-GNFbk"
 
   An \`"sabr": "ok"\` with a byte count means the whole pipeline works here.
-  If it reports HTTP 403, this host's IP is flagged by YouTube — set
-  HTTPS_PROXY to a residential/ISP proxy and restart the service.
+  If it reports a refusal, this host's address class is distrusted by YouTube.
+  Two free-ish fixes, neither needing your home connection:
+
+    1. Rotate IPv6 (preferred, free):
+         ./scripts/check-ipv6.sh          # can this host source arbitrary /64s?
+         # then add EGRESS_IPV6_PREFIX=<your prefix> to $ENV_FILE and restart
+       The systemd unit already grants CAP_NET_ADMIN, which rotation needs.
+
+    2. Route egress through a residential/ISP proxy:
+         HTTPS_PROXY=http://user:pass@host:port   (add to $ENV_FILE)
+
+  See docs/EGRESS.md for the full comparison and caveats.
 
 SUMMARY
