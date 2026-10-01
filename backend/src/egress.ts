@@ -96,7 +96,35 @@ export async function egressInfo(): Promise<EgressInfo> {
  * playback (known to be refused). Reporting both together makes an IP problem
  * unambiguous rather than looking like an application bug.
  */
-export async function probeYouTubeEndpoints(videoId: string): Promise<{
+interface ProbeCacheEntry {
+  at: number;
+  value: Awaited<ReturnType<typeof probeYouTubeEndpointsUncached>>;
+}
+
+const probeCache = new Map<string, ProbeCacheEntry>();
+const PROBE_TTL_MS = 30 * 60_000;
+
+/**
+ * Cached probe.
+ *
+ * From an IP YouTube refuses, the player request hangs rather than failing, so an
+ * uncached probe costs the full timeout. The verdict changes slowly, so it is
+ * cached and also warmed at startup — making /api/egress instant in practice.
+ */
+export async function probeYouTubeEndpoints(videoId: string) {
+  const hit = probeCache.get(videoId);
+  if (hit && Date.now() - hit.at < PROBE_TTL_MS) return hit.value;
+  const value = await probeYouTubeEndpointsUncached(videoId);
+  probeCache.set(videoId, { at: Date.now(), value });
+  return value;
+}
+
+/** Kick off a probe without waiting, so the first real request is fast. */
+export function warmProbe(videoId: string): void {
+  void probeYouTubeEndpoints(videoId).catch(() => {});
+}
+
+async function probeYouTubeEndpointsUncached(videoId: string): Promise<{
   identity: { clientName: string; clientVersion: string; hasVisitor: boolean };
   browse: { ok: boolean; status: number; playability: string };
   player: { ok: boolean; status: number; playability: string };

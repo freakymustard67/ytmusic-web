@@ -28,7 +28,7 @@ import { getLyrics } from './lyrics.js';
 import { TrackService } from './tracks.js';
 import { hasSessionPoToken, openAudioStream, toNodeReadable } from './sabr.js';
 import { proxyStatus } from './proxy.js';
-import { egressInfo, probeYouTubeEndpoints } from './egress.js';
+import { egressInfo, probeYouTubeEndpoints, warmProbe } from './egress.js';
 import { ipv6PoolStatus } from './egressip.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
 
@@ -369,8 +369,10 @@ export async function buildServer(): Promise<FastifyInstance> {
     });
   }
 
-  // Warm the metadata client in the background.
+  // Warm the metadata client and the egress verdict in the background, so the
+  // first /api/egress call does not pay the full probe timeout.
   void yt().catch(() => {});
+  warmProbe('ZczAI-GNFbk');
 
   return app;
 }
