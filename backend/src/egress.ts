@@ -112,6 +112,8 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
 
   /** Returns HTTP status AND the playability status, since a bot-gate block is
    *  served with HTTP 200 — checking the status code alone misreports it. */
+  /** A blocked IP can make these requests hang indefinitely, which on a small
+   *  instance gets the process killed. Always bound them. */
   const post = async (path: string, body: unknown) => {
     const res = await fetch(`https://www.youtube.com/youtubei/v1/${path}?key=${key}&prettyPrint=false`, {
       method: 'POST',
@@ -123,6 +125,7 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
         referer: 'https://www.youtube.com/',
       },
       body: JSON.stringify({ context: { client: { ...client, hl: 'en', gl: 'US' } }, ...(body as object) }),
+      signal: AbortSignal.timeout(15_000),
     });
     let playability = '';
     try {
@@ -150,7 +153,12 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
   let note = '';
   try {
     const { getPlayerInfo } = await import('./sabr.js');
-    const info = await getPlayerInfo(videoId);
+    const info = await Promise.race([
+      getPlayerInfo(videoId),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('player probe timed out after 25s')), 25_000),
+      ),
+    ]);
     sabrStatus = info.status === 'OK' ? 200 : 0;
     note = `status=${info.status} formats=${info.formats.length}`;
   } catch (err) {
