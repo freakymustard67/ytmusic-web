@@ -159,7 +159,7 @@ async function createMinter(): Promise<Minter> {
 }
 
 /** Reuse a minter for a while; minting is expensive and tokens last ~12h. */
-async function getMinter(): Promise<Minter> {
+export async function getMinter(): Promise<Minter> {
   const maxAgeMs = 30 * 60_000;
   if (cachedMinter && Date.now() - cachedMinter.createdAt < maxAgeMs) return cachedMinter;
   cachedMinter = await createMinter();
@@ -207,7 +207,8 @@ export async function getPlayerInfo(videoId: string): Promise<PlayerInfo> {
     parse: true,
   });
 
-  const sabrUrl = (await yt.session.player?.decipher(response.streaming_data?.server_abr_streaming_url)) ?? null;
+  const rawAbr: string | undefined = response.streaming_data?.server_abr_streaming_url;
+  const sabrUrl = rawAbr ? ((await yt.session.player?.decipher(rawAbr).catch(() => null)) ?? rawAbr) : null;
   const ustreamerConfig =
     response.player_config?.media_common_config?.media_ustreamer_request_config?.video_playback_ustreamer_config ?? null;
   const formats: SabrFormatLite[] = (response.streaming_data?.adaptive_formats ?? []).map((f: any) => ({
@@ -220,9 +221,11 @@ export async function getPlayerInfo(videoId: string): Promise<PlayerInfo> {
 
   return {
     videoId,
-    title: response.video_details?.title ?? '',
-    author: response.video_details?.author ?? '',
-    durationSec: response.video_details?.duration ?? null,
+    title: response.video_details?.title ?? response.videoDetails?.title ?? '',
+    author: response.video_details?.author ?? response.videoDetails?.author ?? '',
+    durationSec:
+      response.video_details?.duration ??
+      (response.videoDetails?.lengthSeconds ? Number(response.videoDetails.lengthSeconds) : null),
     status: response.playability_status?.status ?? 'UNKNOWN',
     sabrUrl,
     ustreamerConfig,
@@ -253,6 +256,125 @@ export interface AudioStreamResult {
  * and driving a stream with a URL from an earlier response than the one whose
  * formats/ustreamer config you are using produces a stream that never terminates.
  */
+
+/** Which client produced the last successful player response (for diagnostics). */
+let lastClient = 'unknown';
+
+export function getLastClient(): string {
+  return lastClient;
+}
+
+/** Clients to try, best-first. Each needs a fresh Innertube session. */
+const CLIENT_CHAIN: Array<{ id: string; label: string }> = [
+  // WEB first: on a normal IP it yields a working SABR session. visionos is the
+  // fallback that still answers from datacenter IPs (yt-dlp lists it as needing
+  // no PoToken at all).
+  { id: 'WEB', label: 'web' },
+  { id: 'VISIONOS', label: 'visionos' },
+  { id: 'ANDROID_VR', label: 'android_vr' },
+];
+
+const UA_WEB =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36';
+
+/**
+ * Ask /player until a client returns a usable response.
+ *
+ * Clients differ sharply by IP reputation: from a datacenter address, WEB is
+ * commonly refused outright while visionos (which yt-dlp lists as needing no
+ * PoToken) still answers.
+ */
+async function callPlayerWithFallback(
+  yt: Innertube,
+  videoId: string,
+): Promise<{ response: any; clientLabel: string }> {
+  const errors: string[] = [];
+
+  for (const { id, label } of CLIENT_CHAIN) {
+    try {
+      const session = await Innertube.create({ retrieve_player: false, client_type: id as never });
+      const client = session.session.context.client;
+      const res = await fetch(
+        `https://www.youtube.com/youtubei/v1/player?key=${session.session.api_key}&prettyPrint=false`,
+        {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            'user-agent': UA_WEB,
+            origin: 'https://www.youtube.com',
+            referer: 'https://www.youtube.com/',
+          },
+          body: JSON.stringify({
+            context: { client: { ...client, hl: 'en', gl: 'US' } },
+            videoId,
+            contentCheckOk: true,
+            racyCheckOk: true,
+            playbackContext: { contentPlaybackContext: { signatureTimestamp: yt.session.player?.signature_timestamp ?? 0 } },
+          }),
+        },
+      );
+      if (!res.ok) {
+        errors.push(`${label}: HTTP ${res.status}`);
+        continue;
+      }
+      const json: any = await res.json();
+      const status = readPlayability(json);
+      const sd = readStreamingData(json) ?? {};
+      const hasAbr = !!(sd.serverAbrStreamingUrl ?? sd.server_abr_streaming_url);
+      const nFormats = (sd.adaptiveFormats ?? sd.adaptive_formats ?? []).length;
+      if (status === 'OK' && hasAbr && nFormats > 0) {
+        return { response: json, clientLabel: label };
+      }
+      errors.push(`${label}: ${status ?? 'no status'}`);
+    } catch (err) {
+      errors.push(`${label}: ${String((err as Error).message).slice(0, 60)}`);
+    }
+  }
+  throw new Error(`SABR: no usable client (${errors.join('; ')})`);
+}
+
+/* ---------------------- tolerant player-response accessors ----------------------
+ * The parsed endpoint hands back camelCase nodes while the raw POST returns the
+ * wire format; different clients also differ. These two helpers let the rest of
+ * the module read either without guessing.
+ */
+function readStreamingData(j: any): any {
+  return j?.streaming_data ?? j?.streamingData ?? null;
+}
+function readPlayability(j: any): string {
+  return j?.playability_status?.status ?? j?.playabilityStatus?.status ?? 'UNKNOWN';
+}
+
+/**
+ * Kept for the parsed-endpoint shape; the raw API needs no normalisation.
+ */
+function normalisePlayer(json: any): any {
+  if (json.streaming_data || json.playability_status) {
+    // already snake_case from the raw API — map the fields we use
+    return {
+      playability_status: json.playability_status,
+      streaming_data: {
+        server_abr_streaming_url: json.streaming_data?.serverAbrStreamingUrl,
+        adaptive_formats: json.streaming_data?.adaptiveFormats ?? [],
+      },
+      player_config: {
+        media_common_config: {
+          media_ustreamer_request_config: {
+            video_playback_ustreamer_config:
+              json.player_config?.mediaCommonConfig?.mediaUstreamerRequestConfig?.videoPlaybackUstreamerConfig,
+          },
+        },
+      },
+      video_details: {
+        title: json.videoDetails?.title,
+        author: json.videoDetails?.author,
+        duration: json.videoDetails?.lengthSeconds ? Number(json.videoDetails.lengthSeconds) : null,
+      },
+    };
+  }
+  return json;
+}
+
 async function createSabrSession(videoId: string): Promise<{
   yt: Innertube;
   info: PlayerInfo;
@@ -261,46 +383,45 @@ async function createSabrSession(videoId: string): Promise<{
 }> {
   const yt = await getInnertube();
 
-  // Do the player call here and use THIS response for everything. Letting a
-  // cached session supply the URL while a different response supplies the
-  // formats produces a stream that never terminates.
-  const endpoint = new YTNodes.NavigationEndpoint({ watchEndpoint: { videoId } });
-  const response: any = await endpoint.call(yt.actions, {
-    playbackContext: {
-      contentPlaybackContext: { vis: 0, splay: false, signatureTimestamp: yt.session.player?.signature_timestamp },
-    },
-    contentCheckOk: true,
-    racyCheckOk: true,
-    client: 'WEB',
-    parse: true,
-  });
+  // Try clients in order of how well they work from datacenter IPs. visionos
+  // needs no PoToken at all per yt-dlp's client policy table; WEB is preferred
+  // when it works but is SABR-only and IP-sensitive.
+  const attempts = await callPlayerWithFallback(yt, videoId);
+  const { response, clientLabel } = attempts;
+  lastClient = clientLabel;
 
-  const status: string = response.playability_status?.status ?? 'UNKNOWN';
-  if (status !== 'OK') throw new Error(`SABR: video not playable (${status})`);
+  const status = readPlayability(response);
+  if (status !== 'OK') throw new Error(`SABR: video not playable (${status}) via ${clientLabel}`);
 
-  const sabrUrl = (await yt.session.player?.decipher(response.streaming_data?.server_abr_streaming_url)) ?? null;
+  const streaming = readStreamingData(response) ?? {};
+  const rawAbr: string | undefined = streaming.server_abr_streaming_url ?? streaming.serverAbrStreamingUrl;
+  const sabrUrl = rawAbr ? ((await yt.session.player?.decipher(rawAbr).catch(() => null)) ?? rawAbr) : null;
   const ustreamerConfig =
     response.player_config?.media_common_config?.media_ustreamer_request_config?.video_playback_ustreamer_config ??
+    response.playerConfig?.mediaCommonConfig?.mediaUstreamerRequestConfig?.videoPlaybackUstreamerConfig ??
     null;
-  if (!sabrUrl || !ustreamerConfig) throw new Error('SABR: player response had no SABR parameters');
+  if (!sabrUrl || !ustreamerConfig) throw new Error(`SABR: no SABR parameters via ${clientLabel}`);
 
   // Pass the raw formats straight through: buildSabrFormat already expects the
   // player response's own shape.
-  const sabrFormats = (response.streaming_data?.adaptive_formats ?? []).map((f: any) => buildSabrFormat(f));
+  const rawFormats: any[] = streaming.adaptive_formats ?? streaming.adaptiveFormats ?? [];
+  const sabrFormats = rawFormats.map((f: any) => buildSabrFormat(f));
   const info: PlayerInfo = {
     videoId,
-    title: response.video_details?.title ?? '',
-    author: response.video_details?.author ?? '',
-    durationSec: response.video_details?.duration ?? null,
+    title: response.video_details?.title ?? response.videoDetails?.title ?? '',
+    author: response.video_details?.author ?? response.videoDetails?.author ?? '',
+    durationSec:
+      response.video_details?.duration ??
+      (response.videoDetails?.lengthSeconds ? Number(response.videoDetails.lengthSeconds) : null),
     status,
     sabrUrl,
     ustreamerConfig,
-    formats: (response.streaming_data?.adaptive_formats ?? []).map((f: any) => ({
+    formats: rawFormats.map((f: any) => ({
       itag: f.itag,
-      mimeType: f.mime_type,
-      bitrate: f.bitrate ?? f.average_bitrate ?? 0,
-      approxDurationMs: f.approx_duration_ms,
-      contentLength: f.content_length,
+      mimeType: f.mime_type ?? f.mimeType,
+      bitrate: f.bitrate ?? f.average_bitrate ?? f.averageBitrate ?? 0,
+      approxDurationMs: f.approx_duration_ms ?? f.approxDurationMs,
+      contentLength: f.content_length ?? f.contentLength,
     })),
   };
 

@@ -147,6 +147,14 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
   });
 
+  /** Temporary: which clients work from this host's IP. */
+  app.get('/api/ipdiag', async (req) => {
+    const { probeClients, probePoToken } = await import('./ipdiag.js');
+    const videoId = String((req.query as any)?.videoId ?? 'ZczAI-GNFbk');
+    const [clients, potoken] = await Promise.all([probeClients(videoId), probePoToken()]);
+    return { videoId, potoken, clients };
+  });
+
   app.get('/api/stats', async () => ({
     bytesOut,
     bytesOutHuman: `${(bytesOut / 1024 ** 2).toFixed(1)} MB`,
