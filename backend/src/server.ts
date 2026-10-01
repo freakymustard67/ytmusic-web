@@ -1,16 +1,20 @@
 /**
- * HTTP API + streaming layer.
+ * HTTP API + audio streaming.
  *
  * Endpoints
- *   GET  /health                     liveness + session/browser stats
+ *   GET  /health                     liveness + cache stats
  *   GET  /api/search?q=&type=        songs / videos / albums / artists / playlists
  *   GET  /api/track/:videoId         track metadata
  *   GET  /api/lyrics/:videoId        time-synced lyrics
  *   GET  /api/upnext/:videoId        queue continuation
- *   POST /api/play/:videoId          negotiate playback, return a stream token
- *   GET  /api/stream/:videoId        proxied audio (supports Range)
+ *   POST /api/play/:videoId          warm the cache, report readiness
+ *   GET  /api/stream/:videoId        audio (byte-range capable)
  *   GET  /api/download/:videoId      whole track as WebM/Opus
- *   GET  /api/stats                  bandwidth + session counters
+ *   GET  /api/stats                  bandwidth + cache counters
+ *   GET  /api/diagnostics            environment + SABR health
+ *
+ * No headless browser is involved: playback goes through YouTube's SABR protocol
+ * directly (see sabr.ts), which keeps resident memory near ~100 MB.
  */
 
 import Fastify, { type FastifyInstance, type FastifyReply, type FastifyRequest } from 'fastify';
@@ -20,22 +24,19 @@ import { createReadStream, existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { Readable } from 'node:stream';
 import { config } from './config.js';
-import { BrowserPool, type PlaybackSession } from './browser.js';
 import { getLyrics } from './lyrics.js';
+import { TrackService } from './tracks.js';
+import { openAudioStream, toNodeReadable } from './sabr.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
 
-const pool = new BrowserPool({
-  chromiumPath: config.chromiumPath || undefined,
-  headless: config.headless,
-  maxSessions: config.maxSessions,
-  sessionTtlMs: config.sessionTtlMs,
-  browserIdleMs: config.browserIdleMs,
-  userAgent: config.userAgent,
-  negotiateTimeoutMs: config.negotiateTimeoutMs,
+const tracks = new TrackService({
   cacheDir: config.cacheDir || undefined,
   cacheMaxBytes: config.cacheMaxBytes,
-  captureMaxMs: config.captureMaxMs,
+  fetchMaxMs: config.fetchMaxMs,
+  maxConcurrent: config.maxConcurrentFetches,
 });
+
+tracks.on('warn', (w) => console.warn('[tracks]', JSON.stringify(w)));
 
 /* ------------------------------- guards -------------------------------- */
 
@@ -62,7 +63,7 @@ function accountBytes(n: number): void {
   if (config.bandwidthCapBytes > 0 && bytesOut >= config.bandwidthCapBytes) {
     console.warn(
       `[bandwidth] cap reached: ${(bytesOut / 1024 ** 3).toFixed(2)} GB of ` +
-        `${(config.bandwidthCapBytes / 1024 ** 3).toFixed(2)} GB — refusing further streams`,
+        `${(config.bandwidthCapBytes / 1024 ** 3).toFixed(2)} GB`,
     );
   }
 }
@@ -75,28 +76,20 @@ function clientIp(req: FastifyRequest): string {
   return req.ip;
 }
 
-async function ensureSession(videoId: string): Promise<PlaybackSession> {
-  return pool.acquire(videoId);
-}
-
-function parseRange(header: string | undefined, size: number | null): { start: number; end: number | null } | null {
+function parseRange(header: string | undefined, size: number): { start: number; end: number } | null {
   if (!header) return null;
   const m = header.match(/bytes=(\d*)-(\d*)/);
   if (!m) return null;
   const start = m[1] ? parseInt(m[1], 10) : 0;
-  const end = m[2] ? parseInt(m[2], 10) : size ? size - 1 : null;
-  if (Number.isNaN(start)) return null;
-  return { start, end };
+  const end = m[2] ? parseInt(m[2], 10) : size - 1;
+  if (Number.isNaN(start) || Number.isNaN(end)) return null;
+  return { start, end: Math.min(end, size - 1) };
 }
 
 /* ------------------------------- server -------------------------------- */
 
 export async function buildServer(): Promise<FastifyInstance> {
-  const app = Fastify({
-    logger: { level: process.env.LOG_LEVEL ?? 'info' },
-    // We stream audio bodies ourselves; do not let Fastify buffer them.
-    bodyLimit: 1024 * 1024,
-  });
+  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, bodyLimit: 1024 * 1024 });
 
   await app.register(cors, { origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(',') });
 
@@ -107,14 +100,12 @@ export async function buildServer(): Promise<FastifyInstance> {
       reply.code(429).send({ error: 'rate limited, slow down' });
       return reply;
     }
-    if (url.startsWith('/api/stream') || url.startsWith('/api/download')) {
-      if (overBudget()) {
-        reply.code(503).send({
-          error: 'bandwidth budget exhausted',
-          detail: 'The server reached BANDWIDTH_CAP_GB. Playback resumes when the cap is raised or the process restarts.',
-        });
-        return reply;
-      }
+    if ((url.startsWith('/api/stream') || url.startsWith('/api/download')) && overBudget()) {
+      reply.code(503).send({
+        error: 'bandwidth budget exhausted',
+        detail: 'Set BANDWIDTH_CAP_GB higher, or restart the service to reset the counter.',
+      });
+      return reply;
     }
     if (config.accessPassword) {
       const supplied = req.headers['x-access-password'] ?? (req.query as any)?.pw;
@@ -128,35 +119,31 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get('/health', async () => ({
     ok: true,
     uptimeSec: Math.round(process.uptime()),
-    ...pool.stats(),
+    rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    ...tracks.stats(),
   }));
 
   app.get('/api/health', async () => ({ ok: true }));
 
-  /** Deployment diagnostics: confirms the browser actually launched. */
-  app.get('/api/diagnostics', async () => {
+  /** Environment + SABR health. Pass ?videoId=… to prove a track can be fetched. */
+  app.get('/api/diagnostics', async (req) => {
+    const probeId = String((req.query as any)?.videoId ?? '');
     const base = {
-      chromiumPath: config.chromiumPath || '(auto-detect found nothing)',
-      headless: config.headless,
-      cacheDir: config.cacheDir || '(disabled)',
-      staticDir: config.staticDir || '(none)',
       node: process.version,
       platform: `${process.platform}/${process.arch}`,
-      memoryMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
-      ...pool.stats(),
+      rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      cacheDir: config.cacheDir || '(disabled)',
+      staticDir: config.staticDir || '(none)',
+      bandwidthCapBytes: config.bandwidthCapBytes,
+      ...tracks.stats(),
     };
+    if (!probeId) return { ...base, hint: 'pass ?videoId=… to test SABR negotiation' };
     try {
-      const { chromium } = await import('playwright-core');
-      const browser = await chromium.launch({
-        executablePath: config.chromiumPath || undefined,
-        headless: config.headless,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu'],
-      });
-      const version = browser.version();
-      await browser.close();
-      return { ...base, browserLaunch: 'ok', browserVersion: version };
+      const started = Date.now();
+      const buf = await tracks.fetch(probeId);
+      return { ...base, sabr: 'ok', videoId: probeId, bytes: buf.length, ms: Date.now() - started };
     } catch (err) {
-      return { ...base, browserLaunch: 'failed', browserError: (err as Error).message.slice(0, 400) };
+      return { ...base, sabr: 'failed', videoId: probeId, error: (err as Error).message.slice(0, 300) };
     }
   });
 
@@ -166,96 +153,19 @@ export async function buildServer(): Promise<FastifyInstance> {
     capBytes: config.bandwidthCapBytes,
     capHuman: config.bandwidthCapBytes ? `${(config.bandwidthCapBytes / 1024 ** 3).toFixed(2)} GB` : 'unlimited',
     uptimeSec: Math.round(process.uptime()),
-    ...pool.stats(),
+    rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+    ...tracks.stats(),
   }));
-
-  /**
-   * Lightweight deployment probe.
-   *
-   * Deliberately minimal: Render's free instance has 512 MB, and a heavy probe
-   * that opens several renderers can OOM the container. This one opens a single
-   * page, blocks images/fonts, and reports how far the player gets.
-   */
-  app.get('/api/probe/:videoId', async (req) => {
-    const { videoId } = req.params as { videoId: string };
-    const { chromium } = await import('playwright-core');
-    const out: Record<string, unknown> = {};
-    let browser;
-    try {
-      browser = await chromium.launch({
-        executablePath: config.chromiumPath || undefined,
-        headless: config.headless,
-        args: ['--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--autoplay-policy=no-user-gesture-required'],
-      });
-      const ctx = await browser.newContext({ userAgent: config.userAgent, viewport: { width: 1280, height: 800 } });
-      const page = await ctx.newPage();
-      // Block heavy resources: music playback needs none of them.
-      await page.route('**/*', async (route) => {
-        const type = route.request().resourceType();
-        if (type === 'image' || type === 'font' || type === 'stylesheet' || type === 'media') {
-          await route.abort();
-          return;
-        }
-        await route.continue();
-      });
-      let audioCount = 0;
-      page.on('request', (r) => {
-        const u = r.url();
-        if (/googlevideo\.com\/videoplayback/.test(u) && /mime=audio/.test(u)) audioCount++;
-      });
-
-      const home = await page.goto('https://music.youtube.com/', { waitUntil: 'domcontentloaded', timeout: 40_000 });
-      out.homeStatus = home?.status();
-      await page.waitForTimeout(3500);
-      out.home = await page.evaluate(() => ({
-        title: document.title,
-        hasYtcfg: typeof (window as any).ytcfg !== 'undefined',
-        hasVisitor: !!(window as any).ytcfg?.get?.('INNERTUBE_CONTEXT')?.client?.visitorData,
-        botWall: /confirm you.?re not a bot|unusual traffic/i.test(document.body?.innerText || ''),
-        bytes: document.body?.innerText?.length ?? 0,
-      }));
-
-      await page.goto(`https://music.youtube.com/watch?v=${videoId}`, { waitUntil: 'domcontentloaded', timeout: 40_000 });
-      const deadline = Date.now() + 60_000;
-      let state: any = null;
-      while (Date.now() < deadline && audioCount === 0) {
-        state = await page
-          .evaluate(() => {
-            const v = document.querySelector('video') as HTMLVideoElement | null;
-            if (v) { v.muted = true; v.play?.().catch(() => {}); }
-            document.querySelector<HTMLElement>('.ytp-skip-ad-button, .ytp-ad-skip-button, .ytp-ad-skip-button-modern')?.click?.();
-            return {
-              hasVideoEl: !!v,
-              readyState: v?.readyState ?? null,
-              currentTime: v ? +v.currentTime.toFixed(2) : null,
-              duration: v ? +(v.duration || 0).toFixed(1) : null,
-              error: v?.error?.code ?? null,
-              hasPlayerApi: typeof (window as any).ytmusic !== 'undefined',
-            };
-          })
-          .catch(() => null);
-        if (audioCount > 0) break;
-        await page.waitForTimeout(1200);
-      }
-      out.player = state;
-      out.audioRequests = audioCount;
-      out.ok = audioCount > 0;
-      return out;
-    } catch (err) {
-      out.error = (err as Error).message.slice(0, 300);
-      return out;
-    } finally {
-      await browser?.close().catch(() => {});
-    }
-  });
 
   app.get('/api/search', async (req, reply) => {
     const q = String((req.query as any)?.q ?? '').trim();
     const type = String((req.query as any)?.type ?? 'all') as 'song' | 'video' | 'all';
-    if (!q) { reply.code(400).send({ error: 'missing q' }); return reply; }
+    if (!q) {
+      reply.code(400).send({ error: 'missing q' });
+      return reply;
+    }
     try {
-      const results = await search(q, type);
-      return results;
+      return await search(q, type);
     } catch (err) {
       req.log.error({ err }, 'search failed');
       reply.code(502).send({ error: 'search failed', detail: (err as Error).message });
@@ -266,7 +176,10 @@ export async function buildServer(): Promise<FastifyInstance> {
   app.get('/api/track/:videoId', async (req, reply) => {
     const { videoId } = req.params as { videoId: string };
     const track = await getTrack(videoId);
-    if (!track) { reply.code(404).send({ error: 'not found' }); return reply; }
+    if (!track) {
+      reply.code(404).send({ error: 'not found' });
+      return reply;
+    }
     return track;
   });
 
@@ -274,10 +187,22 @@ export async function buildServer(): Promise<FastifyInstance> {
     const { videoId } = req.params as { videoId: string };
     const q = req.query as any;
     const meta = q.title
-      ? { title: String(q.title), artists: String(q.artist ?? '').split(',').filter(Boolean), album: q.album ?? null, durationSec: q.duration ? Number(q.duration) : null }
-      : await getTrack(videoId).then((t) => (t ? { title: t.title, artists: t.artists, album: t.album, durationSec: t.durationSec } : undefined));
+      ? {
+          title: String(q.title),
+          artists: String(q.artist ?? '')
+            .split(',')
+            .filter(Boolean),
+          album: q.album ?? null,
+          durationSec: q.duration ? Number(q.duration) : null,
+        }
+      : await getTrack(videoId).then((t) =>
+          t ? { title: t.title, artists: t.artists, album: t.album, durationSec: t.durationSec } : undefined,
+        );
     const lyrics = await getLyrics(videoId, meta ?? undefined);
-    if (!lyrics) { reply.code(404).send({ error: 'no lyrics', videoId }); return reply; }
+    if (!lyrics) {
+      reply.code(404).send({ error: 'no lyrics', videoId });
+      return reply;
+    }
     return lyrics;
   });
 
@@ -287,135 +212,87 @@ export async function buildServer(): Promise<FastifyInstance> {
     return { tracks: await getUpNext(videoId, Math.min(Math.max(limit, 1), 50)) };
   });
 
-  /** Negotiate playback up front so the first byte is fast. */
+  /**
+   * Warm the cache. SABR is a sequential stream with no random access, so a track
+   * is downloaded once and then served from disk — that is also what makes
+   * seeking possible.
+   */
   app.post('/api/play/:videoId', async (req, reply) => {
     const { videoId } = req.params as { videoId: string };
     try {
-      const session = await ensureSession(videoId);
-      return {
-        videoId,
-        ready: session.phase === 'ready',
-        itag: session.audio?.itag ?? null,
-        hasPoToken: session.audio?.hasPoToken ?? false,
-        streamUrl: `/api/stream/${videoId}`,
-      };
+      if (await tracks.isCached(videoId)) {
+        return { videoId, ready: true, cached: true, streamUrl: `/api/stream/${videoId}` };
+      }
+      tracks.prefetch(videoId);
+      return { videoId, ready: false, cached: false, streamUrl: `/api/stream/${videoId}` };
     } catch (err) {
-      req.log.error({ err, videoId }, 'negotiation failed');
-      reply.code(502).send({ error: 'could not negotiate playback', detail: (err as Error).message });
+      req.log.error({ err, videoId }, 'play failed');
+      reply.code(502).send({ error: 'could not start playback', detail: (err as Error).message });
       return reply;
     }
   });
 
-  /**
-   * Audio delivery.
-   *
-   * Cache-first: once a complete track has been captured we serve the local file
-   * with real byte-range support, which is what makes seeking work. On a cache
-   * miss we stream live chunks to the client while a capture runs in the
-   * background, so playback starts in a few seconds instead of waiting for the
-   * whole file.
-   *
-   * The browser cannot fetch googlevideo itself — Google's CDN sends no CORS
-   * headers (docs/FINDINGS.md §3) — so everything is relayed here.
-   */
+  /** Audio stream, cache-backed so byte ranges (seeking) work. */
   app.get('/api/stream/:videoId', async (req: FastifyRequest, reply: FastifyReply) => {
     const { videoId } = req.params as { videoId: string };
-    const rangeHeader = req.headers.range as string | undefined;
+    let audio = await tracks.get(videoId);
 
-    // 1. Cache hit -> proper ranged file serving.
-    const cached = await pool.cacheGet(videoId);
-    if (cached) {
-      const size = cached.length;
-      const range = parseRange(rangeHeader, size);
-      const start = range?.start ?? 0;
-      const end = range?.end ?? size - 1;
-      if (start >= size || end >= size || start > end) {
-        reply.code(416).header('content-range', `bytes */${size}`).send();
-        return reply;
+    if (!audio) {
+      try {
+        audio = await tracks.fetch(videoId);
+      } catch (err) {
+        // Fall back to a live SABR stream so playback can still start.
+        req.log.warn({ err, videoId }, 'cache fetch failed, streaming live');
+        try {
+          const { stream } = await openAudioStream(videoId);
+          reply
+            .code(200)
+            .header('content-type', 'audio/webm')
+            .header('accept-ranges', 'none')
+            .header('cache-control', 'no-store');
+          return reply.send(toNodeReadable(stream));
+        } catch (err2) {
+          reply.code(502).send({ error: 'could not fetch audio', detail: (err2 as Error).message });
+          return reply;
+        }
       }
-      const slice = cached.subarray(start, end + 1);
-      accountBytes(slice.length);
-      reply
-        .code(rangeHeader ? 206 : 200)
-        .header('content-type', 'audio/webm')
-        .header('accept-ranges', 'bytes')
-        .header('content-length', String(slice.length))
-        .header('cache-control', 'public, max-age=3600');
-      if (rangeHeader) reply.header('content-range', `bytes ${start}-${end}/${size}`);
-      return reply.send(Readable.from(slice));
     }
 
-    // 2. Cache miss -> stream live, capturing in the background.
-    let session: PlaybackSession;
-    try {
-      session = await ensureSession(videoId);
-    } catch (err) {
-      req.log.error({ err, videoId }, 'negotiation failed');
-      reply.code(502).send({ error: 'could not negotiate playback', detail: (err as Error).message });
+    if (!audio.length) {
+      reply.code(502).send({ error: 'no audio available' });
       return reply;
     }
 
-    // Kick off (or join) a background capture so a later seek hits the cache.
-    void pool.capture(videoId).catch((err) => req.log.warn({ err, videoId }, 'background capture failed'));
+    const size = audio.length;
+    const rangeHeader = req.headers.range as string | undefined;
+    const range = parseRange(rangeHeader, size);
+    const start = range?.start ?? 0;
+    const end = range?.end ?? size - 1;
 
+    if (range && (start >= size || start > end)) {
+      reply.code(416).header('content-range', `bytes */${size}`).send();
+      return reply;
+    }
+
+    const slice = audio.subarray(start, end + 1);
+    accountBytes(slice.length);
     reply
-      .code(200)
+      .code(range ? 206 : 200)
       .header('content-type', 'audio/webm')
-      .header('accept-ranges', 'none') // no random access until cached
-      .header('cache-control', 'no-store');
-
-    // Relay demuxed chunks as they arrive, replaying what was already captured.
-    const body = new Readable({ read() {} });
-    const seen = new Set<number>();
-    let index = 0;
-    let finished = false;
-
-    const push = (buf: Buffer) => {
-      if (finished || reply.raw.writableEnded) return;
-      accountBytes(buf.length);
-      body.push(buf);
-    };
-
-    // Replay anything captured during negotiation.
-    for (const buf of session.chunks) {
-      seen.add(index++);
-      push(buf);
-    }
-    if (overBudget()) {
-      body.push(null);
-      return reply;
-    }
-
-    const unsubscribe = session.onChunk((c) => {
-      if (!c.matched) return; // ad audio — never relay
-      if (c.media.length) push(c.media);
-    });
-
-    const stop = () => {
-      if (finished) return;
-      finished = true;
-      unsubscribe();
-      clearInterval(timer);
-      body.push(null);
-    };
-
-    const timer = setInterval(() => {
-      if (session.captureDone) stop();
-      if (reply.raw.writableEnded) stop();
-    }, 1000);
-    req.raw.on('close', stop);
-    session.touch();
-
-    return reply.send(body);
+      .header('accept-ranges', 'bytes')
+      .header('content-length', String(slice.length))
+      .header('cache-control', 'public, max-age=3600');
+    if (range) reply.header('content-range', `bytes ${start}-${end}/${size}`);
+    return reply.send(Readable.from(slice));
   });
 
-  /** Whole track as one WebM/Opus file (waits for the full capture). */
+  /** Whole track as one downloadable file. */
   app.get('/api/download/:videoId', async (req: FastifyRequest, reply: FastifyReply) => {
     const { videoId } = req.params as { videoId: string };
     try {
-      const buf = await pool.capture(videoId);
+      const buf = await tracks.fetch(videoId);
       if (!buf.length) {
-        reply.code(502).send({ error: 'capture produced no audio' });
+        reply.code(502).send({ error: 'no audio available' });
         return reply;
       }
       const track = await getTrack(videoId).catch(() => null);
@@ -433,12 +310,10 @@ export async function buildServer(): Promise<FastifyInstance> {
     }
   });
 
-
   /* ------------------------- optional frontend ------------------------- */
   if (config.staticDir && existsSync(config.staticDir)) {
     const root = resolve(config.staticDir);
     await app.register(fastifyStatic, { root, wildcard: false });
-    // SPA fallback for client-side routes.
     app.setNotFoundHandler((req, reply) => {
       if (req.url.startsWith('/api/') || req.url.startsWith('/health')) {
         reply.code(404).send({ error: 'not found' });
@@ -448,14 +323,8 @@ export async function buildServer(): Promise<FastifyInstance> {
     });
   }
 
-  // Warm the metadata client in the background; do not block startup.
+  // Warm the metadata client in the background.
   void yt().catch(() => {});
-
-  const reaper = setInterval(() => void pool.reap().catch(() => {}), 60_000);
-  app.addHook('onClose', async () => {
-    clearInterval(reaper);
-    await pool.shutdown();
-  });
 
   return app;
 }

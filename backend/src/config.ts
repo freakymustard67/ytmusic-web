@@ -48,15 +48,15 @@ export const config = {
   port: num('PORT', 10000),
   host: process.env.HOST ?? '0.0.0.0',
 
-  /** Path to a Chromium/Chrome binary. Blank triggers auto-detection. */
+  /** Kept for the optional diagnostics endpoint; playback no longer uses a browser. */
   chromiumPath: process.env.CHROMIUM_PATH || detectChromium(),
   headless: bool('HEADLESS', true),
 
   /** Concurrency + lifetimes, tuned for a 512 MB / 0.1 CPU free instance. */
-  maxSessions: num('MAX_SESSIONS', 2),
-  sessionTtlMs: num('SESSION_TTL_MS', 10 * 60_000),
-  browserIdleMs: num('BROWSER_IDLE_MS', 3 * 60_000),
-  negotiateTimeoutMs: num('NEGOTIATE_TIMEOUT_MS', 30_000),
+  /** How many tracks may download from SABR concurrently. */
+  maxConcurrentFetches: num('MAX_CONCURRENT_FETCHES', 2),
+  /** Abort a SABR download after this long. */
+  fetchMaxMs: num('FETCH_MAX_MS', 150_000),
 
   userAgent:
     process.env.USER_AGENT ??
@@ -88,7 +88,6 @@ export const config = {
    */
   cacheDir: process.env.CACHE_DIR ?? '/tmp/ytmusic-cache',
   cacheMaxBytes: num('CACHE_MAX_MB', 512) * 1024 ** 2,
-  captureMaxMs: num('CAPTURE_MAX_MS', 150_000),
 };
 
 export type Config = typeof config;

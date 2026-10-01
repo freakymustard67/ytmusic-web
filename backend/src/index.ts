@@ -19,7 +19,7 @@ async function main(): Promise<void> {
     await app.listen({ port: config.port, host: config.host });
     app.log.info(
       `listening on http://${config.host}:${config.port} | ` +
-        `chromium=${config.chromiumPath || '(auto)'} maxSessions=${config.maxSessions} ` +
+        `engine=sabr maxFetches=${config.maxConcurrentFetches} cache=${config.cacheDir || 'off'} ` +
         `bandwidthCap=${config.bandwidthCapBytes ? `${(config.bandwidthCapBytes / 1024 ** 3).toFixed(2)}GB` : 'unlimited'}`,
     );
   } catch (err) {
