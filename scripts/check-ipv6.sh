@@ -38,20 +38,30 @@ if [ -z "$prefixes" ]; then
 fi
 info "routes: $(echo "$prefixes" | tr '\n' ' ')"
 
-# A /64 or shorter route is what makes arbitrary addressing possible.
-best=""
+# Rotation needs a range with plenty of addresses. GCP assigns a /96 per NIC and
+# AWS can delegate a /80, so those qualify alongside the usual /64. A /124 (16
+# addresses, DigitalOcean) or a hand-assigned /128 does not.
+best=""; best_bits=0
 for p in $prefixes; do
-  case "$p" in
-    *::/64|*::/56|*::/48|*::/32)
-      best="$p"
-      break
-      ;;
+  bits="${p##*/}"
+  case "$bits" in
+    ''|*[!0-9]*) continue ;;
   esac
+  if [ "$bits" -le 96 ]; then
+    if [ "$best_bits" -eq 0 ] || [ "$bits" -lt "$best_bits" ]; then
+      best="$p"; best_bits="$bits"
+    fi
+  fi
 done
 if [ -z "$best" ]; then
-  bad "no routed /64 (or shorter) prefix — only single addresses or narrower routes"
-  info "Ask the provider for a routed /64, or choose a host that includes one."
+  bad "no routed prefix wide enough to rotate within"
+  info "Found: $(echo "$prefixes" | tr '\n' ' ')"
+  info "A routed /64 (typical VPS), or GCP's per-NIC /96, or a delegated AWS /80 all work."
+  info "A single /128, or a /124 with 16 addresses, does not."
   exit 1
+fi
+if [ "$best_bits" -gt 80 ]; then
+  warn "prefix /$best_bits gives $((2 ** (128 - best_bits))) addresses — enough, but small"
 fi
 ok "routed prefix: $best"
 
@@ -93,7 +103,7 @@ if [ -z "$iface" ]; then
 fi
 info "binding $candidate to $iface and retrying"
 
-if ip -6 addr add "$candidate/64" dev "$iface" 2>/dev/null; then
+if ip -6 addr add "$candidate/$best_bits" dev "$iface" 2>/dev/null; then
   ok "address added to $iface"
 else
   bad "could not add $candidate to $iface — the prefix is not yours to address"
@@ -102,7 +112,7 @@ else
 fi
 
 seen=$(curl -s -6 --max-time 12 --interface "$candidate" "$upstream" 2>/dev/null || true)
-ip -6 addr del "$candidate/64" dev "$iface" 2>/dev/null || true
+ip -6 addr del "$candidate/$best_bits" dev "$iface" 2>/dev/null || true
 
 if [ -n "$seen" ]; then
   ok "arbitrary source address works once bound"

@@ -30,11 +30,46 @@ the only free approach that does not involve your home line. It works because th
 block is a reputation judgement about an *address*, so a fresh address from a
 prefix you control starts clean.
 
-**Requirement that decides everything:** your provider must route a whole `/64`
-(or larger) to your machine so you can source from arbitrary addresses inside it.
-Many providers give you a single `/128`, which is useless here. The
-`smart-ipv6-rotator` project explicitly notes that providers including AWS, Google
-Cloud, Oracle Cloud and Azure do **not** support arbitrary addressing.
+**Requirement that decides everything:** your provider must give you a *prefix*
+you can source from arbitrarily. Many give only a single `/128`, which is useless
+here. Run `./scripts/check-ipv6.sh` on the host to find out.
+
+| Provider | Rotatable prefix | Free tier |
+| --- | --- | --- |
+| **Google Cloud** | ✅ **`/96` per VM NIC** — Google's own guidance is to "use any random /128 from the /96 address range assigned" | ✅ **Always Free e2-micro** (see below) |
+| AWS EC2 | ✅ `/80` via IPv6 prefix delegation to an ENI | ⚠️ credits only; account closes after 6 months |
+| Oracle Cloud | ⚠️ "IP address mask" object takes `cidrPrefixLength` 80–128, but arbitrary sourcing is undocumented | ✅ best hardware (2 OCPU / 12 GB, 10 TB/mo) |
+| Azure | ❌ per-NIC IP configs; public IPv6 prefix caps at `/124` = 16 addresses | 12 months only |
+| Hetzner / netcup / Scaleway / Vultr / Linode / BuyVM | ✅ documented on-link `/64` (BuyVM a `/48`) | ❌ |
+| DigitalOcean | ❌ `/124` = 16 addresses | ❌ |
+
+**Important correction:** the widely-repeated claim that AWS, GCP, Oracle and Azure
+all fail is **partly out of date**. Google documents a `/96` per NIC and AWS now
+documents `/80` prefix delegation. Oracle and Azure still fail or are unverified.
+
+### The free option: GCP Always Free e2-micro
+
+`./scripts/gcp-setup.sh` provisions it end to end — a dual-stack VPC, the instance
+in an Always Free region, swap (1 GB of RAM is tight), and it prints the `/96` to
+use:
+
+```bash
+PROJECT=my-project ./scripts/gcp-setup.sh
+# then, on the VM:
+sudo /opt/ytmusic-web/scripts/check-ipv6.sh     # proves rotation works there
+EGRESS_IPV6_PREFIX=2600:1900:4000:1234::/96
+```
+
+**Read the caveats before relying on it:**
+
+- **Free egress is 1 GB/month.** Audio is ~60 MB/hour, so roughly **16 hours of
+  listening** is free; past that it is $0.12/GiB (~$0.50 for 4 GB). Everything
+  else in the Always Free tier is genuinely free, and traffic to YouTube is not
+  charged.
+- **Whether GCP `/96` rotation still evades YouTube is unverified** — nobody has
+  published a test. That is exactly why `check-ipv6.sh` exists: run it first.
+- e2-micro is 1 GB RAM / 2 shared vCPU. The swap the script adds is not optional.
+- The instance must stay in `us-west1`, `us-central1` or `us-east1` to remain free.
 
 ### Configuration
 
@@ -98,6 +133,8 @@ step.
 
 - **A single static IPv6 address.** IPv6 is itself listed by yt-dlp maintainers as
   a 403 trigger; only *rotation within a routed prefix* helps.
+- **DigitalOcean** (`/124` = 16 addresses) and **Azure** (max `/124`) — too few
+  addresses to rotate, and the maintainers confirm DO specifically fails.
 - **Rotating per request.** Breaks the `ip=`-signed media URL.
 - **Passing cookies.** yt-dlp's own guidance: it "may get your account blocked",
   and the safer fix is a different IP. There is no evidence Premium bypasses an IP

@@ -75,9 +75,11 @@ To get playback you need one of:
 
 - a host whose egress address class is consumer-grade (a home connection works out
   of the box);
-- **a routed IPv6 `/64` you can rotate within** — free, no home connection needed;
-  set `EGRESS_IPV6_PREFIX=2001:db8:1234:5678::/64`. Check whether a host supports
-  it with `./scripts/check-ipv6.sh`;
+- **a rotatable IPv6 prefix** — free, no home connection needed. Google Cloud
+  gives every VM NIC a `/96` (Google's own guidance: "use any random /128 from the
+  /96 address range assigned"), and their e2-micro is Always Free. Provision it
+  with `./scripts/gcp-setup.sh`, then set `EGRESS_IPV6_PREFIX=<your>/96`. On any
+  other host, `./scripts/check-ipv6.sh` tells you whether rotation is possible;
 - a sticky residential/ISP proxy in front of a datacenter host (`HTTPS_PROXY`).
 
 Measured: Render refuses playback in **both** tested regions (Oregon and
