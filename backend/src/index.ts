@@ -1,7 +1,10 @@
+import { installProxy } from './proxy.js';
 import { buildServer } from './server.js';
 import { config } from './config.js';
 
 async function main(): Promise<void> {
+  // Must run before any outbound request: YouTube binds playback to the egress IP.
+  installProxy();
   const app = await buildServer();
 
   const shutdown = async (signal: string) => {

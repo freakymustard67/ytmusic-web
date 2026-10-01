@@ -27,6 +27,7 @@ import { config } from './config.js';
 import { getLyrics } from './lyrics.js';
 import { TrackService } from './tracks.js';
 import { openAudioStream, toNodeReadable } from './sabr.js';
+import { proxyStatus } from './proxy.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
 
 const tracks = new TrackService({
@@ -135,6 +136,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       cacheDir: config.cacheDir || '(disabled)',
       staticDir: config.staticDir || '(none)',
       bandwidthCapBytes: config.bandwidthCapBytes,
+      proxy: proxyStatus(),
       ...tracks.stats(),
     };
     if (!probeId) return { ...base, hint: 'pass ?videoId=… to test SABR negotiation' };

@@ -29,6 +29,7 @@ import { buildSabrFormat } from 'googlevideo/utils';
 import { BotGuardClient } from 'bgutils-js/botguard';
 import { WebPoMinter } from 'bgutils-js/webpo';
 import { parseLooseJSON } from 'bgutils-js/utils';
+import { installProxy } from './proxy.js';
 import { JSDOM } from 'jsdom';
 import { Readable } from 'node:stream';
 
@@ -67,6 +68,7 @@ let cachedMinter: Minter | null = null;
  * jsdom only provides the globals BotGuard's interpreter expects.
  */
 async function createMinter(): Promise<Minter> {
+  installProxy();
   const dom = new JSDOM('<!DOCTYPE html><html lang="en"><head><title></title></head><body></body></html>', {
     url: 'https://www.youtube.com',
     referrer: 'https://www.youtube.com/',
@@ -173,6 +175,7 @@ export async function getMinter(): Promise<Minter> {
 let innertube: Innertube | null = null;
 
 async function getInnertube(): Promise<Innertube> {
+  installProxy();
   if (innertube) return innertube;
   // n-sig deciphering needs a JS evaluator; youtubei.js ships none for Node.
   Platform.shim.eval = (async (data: { output: string }) => new Function(data.output)()) as never;
