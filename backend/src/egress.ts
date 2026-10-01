@@ -98,8 +98,8 @@ export async function egressInfo(): Promise<EgressInfo> {
  */
 export async function probeYouTubeEndpoints(videoId: string): Promise<{
   identity: { clientName: string; clientVersion: string; hasVisitor: boolean };
-  browse: { ok: boolean; status: number };
-  player: { ok: boolean; status: number };
+  browse: { ok: boolean; status: number; playability: string };
+  player: { ok: boolean; status: number; playability: string };
   /** The same player call the SABR path makes, for a like-for-like comparison. */
   playerViaSabrPath: { ok: boolean; status: number; note: string };
 }> {
@@ -110,6 +110,8 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
   // Which client identity is being used matters: per-client policies differ.
   const identity = { clientName: client.clientName, clientVersion: client.clientVersion, hasVisitor: !!client.visitorData };
 
+  /** Returns HTTP status AND the playability status, since a bot-gate block is
+   *  served with HTTP 200 — checking the status code alone misreports it. */
   const post = async (path: string, body: unknown) => {
     const res = await fetch(`https://www.youtube.com/youtubei/v1/${path}?key=${key}&prettyPrint=false`, {
       method: 'POST',
@@ -122,17 +124,24 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
       },
       body: JSON.stringify({ context: { client: { ...client, hl: 'en', gl: 'US' } }, ...(body as object) }),
     });
-    return res.status;
+    let playability = '';
+    try {
+      const j: any = await res.json();
+      playability = j?.playabilityStatus?.status ?? j?.playability_status?.status ?? '';
+    } catch {
+      /* browse has no playability status; that is fine */
+    }
+    return { status: res.status, playability };
   };
 
-  const [browseStatus, playerStatus] = await Promise.all([
-    post('browse', { browseId: 'FEwhat_to_watch' }).catch(() => 0),
+  const [browseRes, playerRes] = await Promise.all([
+    post('browse', { browseId: 'FEwhat_to_watch' }).catch(() => ({ status: 0, playability: '' })),
     post('player', {
       videoId,
       contentCheckOk: true,
       racyCheckOk: true,
       playbackContext: { contentPlaybackContext: { signatureTimestamp: 0 } },
-    }).catch(() => 0),
+    }).catch(() => ({ status: 0, playability: '' })),
   ]);
 
   // Reproduce the SABR path exactly: retrieve_player:true session + parsed call
@@ -148,10 +157,15 @@ export async function probeYouTubeEndpoints(videoId: string): Promise<{
     note = String((err as Error).message).slice(0, 160);
   }
 
+  // "ok" must mean playable, not merely HTTP 200.
   return {
     identity,
-    browse: { ok: browseStatus === 200, status: browseStatus },
-    player: { ok: playerStatus === 200, status: playerStatus },
+    browse: { ok: browseRes.status === 200, status: browseRes.status, playability: browseRes.playability },
+    player: {
+      ok: playerRes.status === 200 && playerRes.playability === 'OK',
+      status: playerRes.status,
+      playability: playerRes.playability || '(none)',
+    },
     playerViaSabrPath: { ok: sabrStatus === 200, status: sabrStatus, note },
   };
 }

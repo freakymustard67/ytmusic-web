@@ -166,15 +166,20 @@ export async function buildServer(): Promise<FastifyInstance> {
       egressInfo(),
       probeYouTubeEndpoints(videoId).catch(() => null),
     ]);
+    // Authoritative signal is the SABR path, since that is what playback uses. The
+    // bare probe only hints: it reports UNPLAYABLE even on a good residential IP
+    // because it omits contentCheckOk / signatureTimestamp context.
     const verdict = !endpoints
       ? 'could not reach YouTube at all'
-      : endpoints.player.ok
-        ? 'playback should work: /player is accepted from this IP'
-        : endpoints.browse.ok
-          ? 'this IP is distrusted for playback: /browse works but /player is refused (HTTP ' +
-            endpoints.player.status +
-            '). Use a residential/ISP egress (HTTPS_PROXY) or pin EGRESS_FAMILY=ipv4/ipv6.'
-          : 'no YouTube endpoint is reachable from this IP';
+      : endpoints.playerViaSabrPath.ok
+        ? 'playback works from this IP'
+        : !endpoints.browse.ok
+          ? 'no YouTube endpoint is reachable from this IP'
+          : 'playback is refused from this IP (' +
+            (endpoints.playerViaSabrPath.note || endpoints.player.playability) +
+            '). This is the address-class block: /browse answers while the player does not. ' +
+            'Fix it by egressing through a consumer/residential IP (set HTTPS_PROXY), or by ' +
+            'hosting where the egress is consumer-grade.';
     return { videoId, proxy: proxyStatus(), egress: info, endpoints, verdict };
   });
 
