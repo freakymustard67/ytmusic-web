@@ -79,11 +79,43 @@ EGRESS_IPV6_POOL=4                            # addresses kept warm
 EGRESS_IPV6_ROTATE_HOURS=6                    # re-lease interval
 ```
 
+### It needs CAP_NET_ADMIN (verified the hard way)
+
+A routed prefix alone is **not** enough. Measured on a dual-stack host:
+
+| source address | result |
+| --- | --- |
+| an address already on the interface | works, and the source is honoured |
+| an arbitrary address inside the routed `/64` | **silently falls back to the primary address** |
+
+So the address must be added to the interface first (`ip -6 addr add`). The service
+does that itself and needs either root or the capability:
+
+```bash
+# simplest: run the service as root (it is a single-purpose process)
+# tighter: grant only what is needed
+sudo setcap cap_net_admin+ep "$(command -v node)"
+# or, in a systemd unit:
+#   AmbientCapabilities=CAP_NET_ADMIN
+#   CapabilityBoundingSet=CAP_NET_ADMIN
+```
+
+Without it you get one clear warning per address and no rotation — never a silent
+failure to the wrong address.
+
+Two further gotchas that cost real debugging time, both now handled:
+
+- The address must stay inside the routed prefix. A GCP `/96` allows six hex
+  groups, an AWS `/80` allows five; going longer puts the address outside the range
+  and the provider drops the traffic.
+- The generated text must be valid IPv6. A `::`-compressed prefix already stands
+  for one or more zero groups, so appending a fixed number of groups produced nine
+  groups and the kernel rejected it with "inet6 prefix is expected". Addresses are
+  now built by bit-filling and validated before use.
+
 How it behaves:
 
 - each **playback session** is pinned to one address for its whole lifetime;
-- the address is emitted as the IPv6 **source** address, so no `ip addr add` or
-  root access is needed when the prefix is already routed;
 - an address that produces `LOGIN_REQUIRED` or a 403 is marked burned and never
   reused;
 - with no prefix configured the whole mechanism is inert (verified: playback still
