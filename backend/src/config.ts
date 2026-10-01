@@ -59,6 +59,17 @@ export const config = {
    * over IPv6; pin `ipv4` if the v6 route is the one being refused.
    */
   egressFamily: (process.env.EGRESS_FAMILY ?? 'auto') as 'auto' | 'ipv4' | 'ipv6',
+
+  /**
+   * A routed IPv6 prefix to rotate egress addresses within, e.g.
+   * `2001:db8:1234:5678::/64`. This is the free, non-residential way past
+   * YouTube's address-class block. Unset = normal egress.
+   */
+  ipv6Prefix: process.env.EGRESS_IPV6_PREFIX ?? '',
+  /** How many distinct addresses to keep warm. */
+  ipv6PoolSize: num('EGRESS_IPV6_POOL', 4),
+  /** Re-lease an address after this many hours. */
+  ipv6RotateHours: num('EGRESS_IPV6_ROTATE_HOURS', 6),
 };
 
 export type Config = typeof config;

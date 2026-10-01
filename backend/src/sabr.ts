@@ -30,6 +30,7 @@ import { BotGuardClient } from 'bgutils-js/botguard';
 import { WebPoMinter } from 'bgutils-js/webpo';
 import { parseLooseJSON } from 'bgutils-js/utils';
 import { installProxy } from './proxy.js';
+import { runWithAddress } from './egressip.js';
 import { JSDOM } from 'jsdom';
 import { Readable } from 'node:stream';
 
@@ -497,7 +498,10 @@ async function createSabrSession(videoId: string): Promise<{
 }
 
 export async function openAudioStream(videoId: string): Promise<AudioStreamResult> {
-  const session = await createSabrSession(videoId);
+  // Pin one egress address for the whole session: the media URL is signed with
+  // `ip=`, so negotiation and every media request must leave from the same place.
+  return runWithAddress(async () => {
+    const session = await createSabrSession(videoId);
   const { yt, info, sabr, sabrFormats } = session;
 
   // selectFormats() insists on BOTH a video and an audio pick, so supply explicit
@@ -520,12 +524,13 @@ export async function openAudioStream(videoId: string): Promise<AudioStreamResul
 
   const { audioStream, selectedFormats } = await sabr.start(options);
 
-  return {
-    stream: audioStream,
-    itag: selectedFormats.audioFormat?.itag ?? audioFormat.itag,
-    mimeType: selectedFormats.audioFormat?.mimeType ?? audioFormat.mimeType ?? 'audio/webm',
-    durationMs: Number(audioFormat.approxDurationMs) || 0,
-  };
+    return {
+      stream: audioStream,
+      itag: selectedFormats.audioFormat?.itag ?? audioFormat.itag,
+      mimeType: selectedFormats.audioFormat?.mimeType ?? audioFormat.mimeType ?? 'audio/webm',
+      durationMs: Number(audioFormat.approxDurationMs) || 0,
+    };
+  });
 }
 
 /** Convenience: collect a whole track into one Buffer (used for downloads/caching). */

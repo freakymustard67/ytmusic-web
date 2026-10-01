@@ -29,6 +29,7 @@ import { TrackService } from './tracks.js';
 import { hasSessionPoToken, openAudioStream, toNodeReadable } from './sabr.js';
 import { proxyStatus } from './proxy.js';
 import { egressInfo, probeYouTubeEndpoints } from './egress.js';
+import { ipv6PoolStatus } from './egressip.js';
 import { getTrack, getUpNext, search, yt } from './ytmusic.js';
 
 const tracks = new TrackService({
@@ -144,6 +145,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       staticDir: config.staticDir || '(none)',
       bandwidthCapBytes: config.bandwidthCapBytes,
       proxy: proxyStatus(),
+      egressIpv6: ipv6PoolStatus(),
       ...tracks.stats(),
     };
     if (!probeId) return { ...base, hint: 'pass ?videoId=… to test SABR negotiation' };
