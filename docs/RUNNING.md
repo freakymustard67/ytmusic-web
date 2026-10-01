@@ -1,8 +1,21 @@
 # Running it yourself
 
-The deployment target is the only thing that failed (Render free = 512 MB, and
-Chromium needs more). The app itself is complete and verified. Here is the
-shortest path to a working instance.
+The app is complete and verified. The one thing that cannot be fixed in code is
+the **egress IP**: YouTube refuses `/youtubei/v1/player` from datacenter addresses
+with 403 for every client. Memory is no longer a constraint (playback speaks SABR
+with no browser, ~150–300 MB), so the shortest path to a working instance is any
+machine with a normal IP — a home box, a cheap VPS, or an always-free cloud VM.
+
+The one-command route:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/freakymustard67/ytmusic-web/main/scripts/install.sh | sudo bash
+```
+
+It verifies playback from that host's IP as its final step. If it reports 403, set
+`HTTPS_PROXY` to a residential/ISP proxy and restart.
+
+The manual route, and the commands used to verify everything, follow.
 
 ## On this machine
 
