@@ -91,6 +91,21 @@ To get playback you need one of:
 | GET | `/api/download/:videoId` | whole track as WebM/Opus |
 | GET | `/api/stats` | bytes served, cache and session counters |
 
+## Quick start
+
+**A host with a usable egress IP** (a VPS, home box, or always-free cloud VM) —
+one command:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/freakymustard67/ytmusic-web/main/scripts/install.sh | sudo bash
+# or, for automatic HTTPS on your own domain:
+sudo DOMAIN=music.example.com ACCESS_PASSWORD=changeme ./scripts/install.sh
+```
+
+It installs Node 22, adds swap on small machines, sets up a systemd service
+(optional Caddy TLS), and then **verifies SABR playback from that host's IP**,
+telling you plainly if the IP is flagged.
+
 ## Running locally
 
 ```bash
@@ -108,21 +123,13 @@ Any Chromium/Chrome binary works; `playwright-core` does not download one.
 
 ## Deploying to Render
 
-`render.yaml` is a ready blueprint (Docker runtime, free plan, health check at
-`/health`). Push the repo, then in Render: **New → Blueprint**, pick the repo.
+`render.yaml` and the `Dockerfile` are ready; the service is live at
+<https://ytmusic-web.onrender.com>. **Search works there; playback does not**,
+because YouTube refuses `/youtubei/v1/player` from Render's datacenter IP with 403
+for every client. Memory is no longer the issue — the container sits at ~150 MB.
 
-### Free-tier limitation (measured, not theoretical)
-
-Render's free instance is **512 MB**, and Node idles at ~300 MB of it. Loading
-YouTube Music in Chromium needs a few hundred MB more, so the container gets
-**OOM-killed** and Render serves a 502 while it restarts. Search and lyrics work;
-playback does not. This is documented with measurements in
-[docs/FINDINGS.md §9](docs/FINDINGS.md).
-
-To run this in practice you need a host with roughly **1 GB+ RAM**. Anything with
-real egress is also a far better fit than the free tier's 5 GB/month — for example
-Oracle Cloud Always Free (10 TB/month egress, 12 GB RAM) costs nothing and removes
-both limits at once.
+Set `HTTPS_PROXY` to a residential/ISP proxy and playback starts working, because
+the app routes *all* outbound traffic (YouTube, BotGuard, googlevideo) through it.
 
 ### Read this before making it public
 

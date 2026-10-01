@@ -1,35 +1,4 @@
 /** Runtime configuration, all overridable by environment variable. */
-import { existsSync } from 'node:fs';
-
-/**
- * Find a usable Chromium binary.
- *
- * `playwright-core` ships no browser, and the path differs between distros
- * (`chromium` on Debian/Ubuntu 24.04+, `chromium-browser` on Ubuntu 22.04 and
- * older). Checking well-known locations keeps deployment working without having
- * to pin CHROMIUM_PATH per platform.
- */
-function detectChromium(): string {
-  const candidates = [
-    process.env.CHROME_PATH ?? '',
-    '/usr/bin/chromium',
-    '/usr/bin/chromium-browser',
-    '/usr/bin/google-chrome',
-    '/usr/bin/google-chrome-stable',
-    '/snap/bin/chromium',
-    '/usr/lib/chromium/chromium',
-    '/opt/google/chrome/chrome',
-  ].filter(Boolean);
-  for (const p of candidates) {
-    try {
-      if (existsSync(p)) return p;
-    } catch {
-      /* ignore */
-    }
-  }
-  return '';
-}
-
 
 function num(name: string, fallback: number): number {
   const v = process.env[name];
@@ -48,14 +17,9 @@ export const config = {
   port: num('PORT', 10000),
   host: process.env.HOST ?? '0.0.0.0',
 
-  /** Kept for the optional diagnostics endpoint; playback no longer uses a browser. */
-  chromiumPath: process.env.CHROMIUM_PATH || detectChromium(),
-  headless: bool('HEADLESS', true),
-
-  /** Concurrency + lifetimes, tuned for a 512 MB / 0.1 CPU free instance. */
-  /** How many tracks may download from SABR concurrently. */
+  /** Concurrency for SABR track downloads, tuned for a small instance. */
   maxConcurrentFetches: num('MAX_CONCURRENT_FETCHES', 2),
-  /** Abort a SABR download after this long. */
+  /** Abort a track download after this long. */
   fetchMaxMs: num('FETCH_MAX_MS', 150_000),
 
   userAgent:
@@ -63,10 +27,8 @@ export const config = {
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
 
   /**
-   * Bandwidth guard. Render's free tier gives the whole workspace 5 GB/month and
-   * suspends every free service when it runs out. 0 disables the guard (default,
-   * because this deployment is intentionally public). Set BANDWIDTH_CAP_GB=4 to
-   * keep a safety margin.
+   * Bandwidth guard. A free PaaS tier typically meters egress for the whole
+   * account and suspends services when it runs out. 0 disables the guard.
    */
   bandwidthCapBytes: num('BANDWIDTH_CAP_GB', 0) * 1024 ** 3,
 
@@ -78,16 +40,18 @@ export const config = {
 
   corsOrigin: process.env.CORS_ORIGIN ?? '*',
 
-  /** Serve the built frontend from this directory when present. */
+  /** Serve the built front-end from this directory when present. */
   staticDir: process.env.STATIC_DIR ?? '',
 
   /**
-   * Captured audio cache. Ephemeral on Render's free tier (no persistent disks),
-   * but it survives for the life of the instance and makes seeking work.
-   * Empty CACHE_DIR disables caching and forces live streaming only.
+   * Audio cache. Makes byte-range seeking possible, since SABR is a sequential
+   * stream. Empty CACHE_DIR disables caching.
    */
   cacheDir: process.env.CACHE_DIR ?? '/tmp/ytmusic-cache',
   cacheMaxBytes: num('CACHE_MAX_MB', 512) * 1024 ** 2,
+
+  /** Trust X-Forwarded-For for rate limiting (true behind a reverse proxy). */
+  trustProxy: bool('TRUST_PROXY', true),
 };
 
 export type Config = typeof config;

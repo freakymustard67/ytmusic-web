@@ -90,7 +90,11 @@ function parseRange(header: string | undefined, size: number): { start: number; 
 /* ------------------------------- server -------------------------------- */
 
 export async function buildServer(): Promise<FastifyInstance> {
-  const app = Fastify({ logger: { level: process.env.LOG_LEVEL ?? 'info' }, bodyLimit: 1024 * 1024 });
+  const app = Fastify({
+    logger: { level: process.env.LOG_LEVEL ?? 'info' },
+    bodyLimit: 1024 * 1024,
+    trustProxy: config.trustProxy,
+  });
 
   await app.register(cors, { origin: config.corsOrigin === '*' ? true : config.corsOrigin.split(',') });
 
@@ -133,6 +137,7 @@ export async function buildServer(): Promise<FastifyInstance> {
       node: process.version,
       platform: `${process.platform}/${process.arch}`,
       rssMb: Math.round(process.memoryUsage().rss / 1024 / 1024),
+      engine: 'sabr (no browser)',
       cacheDir: config.cacheDir || '(disabled)',
       staticDir: config.staticDir || '(none)',
       bandwidthCapBytes: config.bandwidthCapBytes,
